@@ -1,4 +1,5 @@
 # AXP — Agent Execution Protocol
+
 ## Technical Architecture (v0 draft)
 
 > **What AXP is.** An open protocol that gives AI agents a secure, streaming place to run code
@@ -8,7 +9,7 @@
 > backend, or expose its own capabilities to MCP clients.
 >
 > **Relationship to MCP.** MCP standardizes how agents discover and call tools. AXP focuses on a
-> different concern: giving an agent a safe, isolated environment to *execute* in. The two compose —
+> different concern: giving an agent a safe, isolated environment to _execute_ in. The two compose —
 > AXP speaks MCP in both directions (see §8).
 
 This document describes the protocol's object model, layers, and security design. It is a working
@@ -24,9 +25,9 @@ AXP is organized around five ideas:
 2. **Workspace-first** — each session is bound to an isolated filesystem workspace.
 3. **Stream-first** — execution is a structured async job with streaming logs, not atomic call/return.
 4. **Capability-first** — the agent holds explicit, least-privilege, attenuable capabilities, never blanket access.
-5. **Sandbox-first** — a kernel-enforced boundary is established by a trusted supervisor *before* the session starts.
+5. **Sandbox-first** — a kernel-enforced boundary is established by a trusted supervisor _before_ the session starts.
 
-**In one line:** *AXP gives agents a safe place to operate — secure, streaming, and lean on context.*
+**In one line:** _AXP gives agents a safe place to operate — secure, streaming, and lean on context._
 
 ---
 
@@ -46,31 +47,31 @@ Session ── bound to ──► Workspace        (isolated filesystem root)
    └── Providers ──► Native | CodeMode | MCP-Bridge | Skill
 ```
 
-| Primitive | Definition |
-|---|---|
-| **Session** | The unit of stateful execution context. Resumable by `session_id`. Carries the workspace, sandbox tier, capability set, and audit stream. |
-| **Workspace** | An isolated filesystem root the session may touch. Default-deny outside it. |
-| **Capability** | An explicit, **unforgeable, attenuable** permission token: `fs.read(path)`, `fs.write(path)`, `net.connect(domain)`, `proc.spawn`, or a named tool/skill. A holder can derive a *weaker* child capability, never a stronger one. |
-| **SandboxTier** | The enforcement guarantee in effect: `kernel-lsm` \| `container` \| `process-token` \| `dev-none`. Declared per session; cannot be self-downgraded. |
-| **Provider** | A backend that supplies capabilities. Native (syscalls/CLIs), CodeMode (sandboxed code runtime), MCP-Bridge (mounts MCP servers), Skill (procedure bundles). |
-| **Job** | A structured async execution (a command or a code submission) with a reliable, ordered, **resumable** log stream. Decoupled from connection lifetime. |
-| **CapabilityIndex** | The discovery surface: every capability as `name — one-line description`. Full typed schema fetched only on demand. |
+| Primitive           | Definition                                                                                                                                                                                                                       |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Session**         | The unit of stateful execution context. Resumable by `session_id`. Carries the workspace, sandbox tier, capability set, and audit stream.                                                                                        |
+| **Workspace**       | An isolated filesystem root the session may touch. Default-deny outside it.                                                                                                                                                      |
+| **Capability**      | An explicit, **unforgeable, attenuable** permission token: `fs.read(path)`, `fs.write(path)`, `net.connect(domain)`, `proc.spawn`, or a named tool/skill. A holder can derive a _weaker_ child capability, never a stronger one. |
+| **SandboxTier**     | The enforcement guarantee in effect: `kernel-lsm` \| `container` \| `process-token` \| `dev-none`. Declared per session; cannot be self-downgraded.                                                                              |
+| **Provider**        | A backend that supplies capabilities. Native (syscalls/CLIs), CodeMode (sandboxed code runtime), MCP-Bridge (mounts MCP servers), Skill (procedure bundles).                                                                     |
+| **Job**             | A structured async execution (a command or a code submission) with a reliable, ordered, **resumable** log stream. Decoupled from connection lifetime.                                                                            |
+| **CapabilityIndex** | The discovery surface: every capability as `name — one-line description`. Full typed schema fetched only on demand.                                                                                                              |
 
 ---
 
 ## 3. Layered protocol stack
 
-| Layer | Responsibility | Approach |
-|---|---|---|
-| **L0 Transport** | Move framed messages | Streamable-HTTP baseline (single endpoint, POST → resumable SSE, `Last-Event-ID`); stdio for local; optional gRPC / Cap'n Proto binary fast-path. |
-| **L1 Control** | Handshake, auth, capability negotiation, sandbox-tier declaration | Stateful session; OAuth/OIDC supported where the identity provider differs from the server. |
-| **L2 Discovery** | Lazy capability discovery | Compact index for breadth + full schema on demand (§6). Registration includes a description-quality check. |
-| **L3 Execution** | Run jobs, stream logs, reattach | Structured async jobs + durable replay buffer; opt-in PTY capability. |
-| **L4 Providers** | Supply capabilities | Native / CodeMode / MCP-Bridge / Skill behind one `Provider` interface. |
-| **L5 Security** | Enforce the boundary | Object-capability tokens + kernel sandbox + egress proxy + audit + control/data-plane separation. |
+| Layer            | Responsibility                                                    | Approach                                                                                                                                          |
+| ---------------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **L0 Transport** | Move framed messages                                              | Streamable-HTTP baseline (single endpoint, POST → resumable SSE, `Last-Event-ID`); stdio for local; optional gRPC / Cap'n Proto binary fast-path. |
+| **L1 Control**   | Handshake, auth, capability negotiation, sandbox-tier declaration | Stateful session; OAuth/OIDC supported where the identity provider differs from the server.                                                       |
+| **L2 Discovery** | Lazy capability discovery                                         | Compact index for breadth + full schema on demand (§6). Registration includes a description-quality check.                                        |
+| **L3 Execution** | Run jobs, stream logs, reattach                                   | Structured async jobs + durable replay buffer; opt-in PTY capability.                                                                             |
+| **L4 Providers** | Supply capabilities                                               | Native / CodeMode / MCP-Bridge / Skill behind one `Provider` interface.                                                                           |
+| **L5 Security**  | Enforce the boundary                                              | Object-capability tokens + kernel sandbox + egress proxy + audit + control/data-plane separation.                                                 |
 
 **A note on token efficiency.** The model never sees L0 framing bytes — they are parsed and
-discarded before tokenization. So the wire format is a *latency/bandwidth* concern, not a *context*
+discarded before tokenization. So the wire format is a _latency/bandwidth_ concern, not a _context_
 concern. Context efficiency lives entirely at L2: what enters the model's context window.
 
 ---
@@ -108,6 +109,7 @@ job.status { job_id }                                  → running | exited(code
 ```
 
 **Reliability (transport-independent):**
+
 - Command lifetime is **decoupled** from connection lifetime.
 - **Reattach-by-job-id** with an **offset/epoch durable replay buffer**: an agent can detach, do other
   work, reconnect, and read the full log — output is never lost.
@@ -145,33 +147,37 @@ axp.describe(name)   → {signature, schema}  # full detail, only for the chosen
 ## 7. Security model — zero-trust local execution
 
 ### 7.1 Object-capability core
+
 - Capabilities are **unforgeable references**, not forgeable strings — possession is authority.
 - **Attenuation:** any holder can mint a strictly weaker child capability (narrower path, fewer verbs,
   shorter TTL), enabling safe delegation to sub-agents or code-mode.
 
 ### 7.2 Kernel sandbox (portable contract, per-OS backends)
+
 The agent requests capabilities **abstractly**; a trusted supervisor compiles them to OS-native policy.
 The agent **never writes OS-specific policy** — this is both the cross-platform layer and a key defense
 against config-based escapes.
 
-| OS / Arch | Enforcement backend | Tier |
-|---|---|---|
-| Linux (x86_64/arm64) | Bubblewrap + **Landlock** + **seccomp-bpf** + network namespace | `kernel-lsm` |
-| macOS (x86_64/arm64) | **Seatbelt** / `sandbox-exec` (SBPL) | `kernel-lsm` |
+| OS / Arch              | Enforcement backend                                             | Tier            |
+| ---------------------- | --------------------------------------------------------------- | --------------- |
+| Linux (x86_64/arm64)   | Bubblewrap + **Landlock** + **seccomp-bpf** + network namespace | `kernel-lsm`    |
+| macOS (x86_64/arm64)   | **Seatbelt** / `sandbox-exec` (SBPL)                            | `kernel-lsm`    |
 | Windows (x86_64/arm64) | **AppContainer** + Restricted Token + Job Object + per-user WFP | `process-token` |
-| any | container / microVM (Firecracker / libkrun) fallback | `container` |
+| any                    | container / microVM (Firecracker / libkrun) fallback            | `container`     |
 
 - **The tier is declared per session.** A client can refuse to run sensitive work under a weaker tier.
   A session's tier **cannot be silently downgraded** by agent-local configuration.
 - Sandbox guarantees differ by platform; AXP states the tier honestly rather than implying uniform isolation.
 
 ### 7.3 Network egress
-Operating systems do not provide a kernel primitive for *domain* allowlisting, so AXP routes network
+
+Operating systems do not provide a kernel primitive for _domain_ allowlisting, so AXP routes network
 capabilities through an **out-of-process egress proxy** in a per-process network namespace
 (default-deny + allowlist). Residual risks (SNI fronting, ECH, DNS-based exfiltration) are documented
 rather than glossed over.
 
 ### 7.4 Control/data-plane separation
+
 - Sandbox **policy is control-plane** and lives **outside** the workspace. The agent process cannot
   author or disable its own sandbox.
 - Configuration and rules files are treated as **untrusted data**; they (and their parent directories)
@@ -179,6 +185,7 @@ rather than glossed over.
 - Policy is compiled by the supervisor **before** the session is initialized.
 
 ### 7.5 Honest limits
+
 In-OS sandboxes share the host kernel. Sandboxing contains **blast radius**; it does not by itself stop
 prompt injection. Robust deployments combine it with control/data-plane separation, egress filtering,
 and human approval for irreversible actions. AXP ships an **append-only audit log** (every command,
