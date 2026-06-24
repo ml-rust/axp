@@ -66,6 +66,31 @@ pub enum Error {
         /// Human-readable reason for the failure.
         reason: String,
     },
+
+    /// A job was denied because the required capability was not granted to the session.
+    #[error("capability denied: requires `{required}`")]
+    CapabilityDenied {
+        /// The capability name that was required but not present.
+        required: String,
+    },
+
+    /// A path used as a working directory falls outside the session workspace.
+    #[error("workspace violation: path `{path}` is outside the session workspace")]
+    WorkspaceViolation {
+        /// The path that was rejected.
+        path: std::path::PathBuf,
+    },
+
+    /// A job lookup failed because no job with that id exists.
+    #[error("job not found: {0:?}")]
+    JobNotFound(axp_proto::JobId),
+
+    /// A log push was rejected because the buffer would exceed its byte cap.
+    #[error("log buffer overflow: exceeded {cap} bytes")]
+    LogBufferOverflow {
+        /// The byte cap that was exceeded.
+        cap: usize,
+    },
 }
 
 /// A `Result` alias that defaults the error type to [`Error`].

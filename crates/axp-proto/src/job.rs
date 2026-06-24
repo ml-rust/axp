@@ -47,6 +47,22 @@ pub struct JobStartResponse {
     pub job_id: JobId,
 }
 
+/// Wire-format job status. Internally tagged on `status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum JobStatusProto {
+    /// Created, not yet started.
+    Pending,
+    /// Process is running.
+    Running,
+    /// Process exited with this code.
+    Exited { code: i32 },
+    /// Process was killed (signal/cancel).
+    Killed,
+    /// Job failed before/around execution (capability denial, spawn error, buffer overflow, …).
+    Failed { reason: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +145,47 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let resp2: JobStartResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, resp2);
+    }
+
+    #[test]
+    fn job_status_proto_pending_serializes() {
+        let val = serde_json::to_value(JobStatusProto::Pending).unwrap();
+        assert_eq!(val, serde_json::json!({"status": "pending"}));
+    }
+
+    #[test]
+    fn job_status_proto_exited_serializes() {
+        let val = serde_json::to_value(JobStatusProto::Exited { code: 0 }).unwrap();
+        assert_eq!(val, serde_json::json!({"status": "exited", "code": 0}));
+    }
+
+    #[test]
+    fn job_status_proto_failed_serializes() {
+        let val = serde_json::to_value(JobStatusProto::Failed { reason: "x".into() }).unwrap();
+        assert_eq!(val, serde_json::json!({"status": "failed", "reason": "x"}));
+    }
+
+    #[test]
+    fn job_status_proto_pending_round_trips() {
+        let orig = JobStatusProto::Pending;
+        let val = serde_json::to_value(&orig).unwrap();
+        let back: JobStatusProto = serde_json::from_value(val).unwrap();
+        assert_eq!(orig, back);
+    }
+
+    #[test]
+    fn job_status_proto_exited_round_trips() {
+        let orig = JobStatusProto::Exited { code: 0 };
+        let val = serde_json::to_value(&orig).unwrap();
+        let back: JobStatusProto = serde_json::from_value(val).unwrap();
+        assert_eq!(orig, back);
+    }
+
+    #[test]
+    fn job_status_proto_failed_round_trips() {
+        let orig = JobStatusProto::Failed { reason: "x".into() };
+        let val = serde_json::to_value(&orig).unwrap();
+        let back: JobStatusProto = serde_json::from_value(val).unwrap();
+        assert_eq!(orig, back);
     }
 }
