@@ -8,7 +8,11 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+axp-proto = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

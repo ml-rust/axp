@@ -10,6 +10,28 @@ pub enum Error {
     /// A code path that has not yet been implemented.
     #[error("not yet implemented: {0}")]
     NotImplemented(&'static str),
+
+    /// The given path could not be used as a workspace root.
+    #[error("invalid workspace path `{path}`: {reason}")]
+    InvalidWorkspace {
+        /// The path that was rejected.
+        path: std::path::PathBuf,
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
+
+    /// A capability string failed to parse.
+    #[error("capability parse error `{raw}`: {reason}")]
+    CapabilityParse {
+        /// The raw string that was rejected.
+        raw: String,
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
+
+    /// A session lookup failed because no session with that id exists.
+    #[error("session not found: {0:?}")]
+    SessionNotFound(axp_proto::SessionId),
 }
 
 /// A `Result` alias that defaults the error type to [`Error`].
