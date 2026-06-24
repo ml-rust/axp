@@ -4,6 +4,9 @@ research/
 # local tooling config
 .claude/settings.local.json
 
+# Rust build artifacts (Cargo.lock is intentionally committed — this workspace ships a binary)
+/target/
+
 # scratch / temp
 *.tmp
 .DS_Store
