@@ -1,0 +1,12 @@
+# /research is INTERNAL — strategy, raw findings, experiments, cloned repos. Never published.
+research/
+
+# local tooling config
+.claude/settings.local.json
+
+# scratch / temp
+*.tmp
+.DS_Store
+
+# session prep scratch (never committed)
+.claude/prep/
