@@ -32,6 +32,40 @@ pub enum Error {
     /// A session lookup failed because no session with that id exists.
     #[error("session not found: {0:?}")]
     SessionNotFound(axp_proto::SessionId),
+
+    /// A capability lookup failed because no capability with that name is registered.
+    #[error("capability not found: `{name}`")]
+    CapabilityNotFound {
+        /// The capability name that was not found.
+        name: String,
+    },
+
+    /// A provider registration was rejected because a provider with that id already exists.
+    #[error("duplicate provider: `{id}`")]
+    DuplicateProvider {
+        /// The provider id that already exists.
+        id: String,
+    },
+
+    /// A provider registration was rejected because two capabilities share the same local name.
+    #[error("duplicate capability `{name}` within provider `{provider}`")]
+    DuplicateCapability {
+        /// The provider id that contains the duplicate.
+        provider: String,
+        /// The local capability name that appears more than once.
+        name: String,
+    },
+
+    /// A capability description failed the quality gate during provider registration.
+    #[error("description quality check failed for `{provider}:{capability}`: {reason}")]
+    DescriptionQuality {
+        /// The provider id whose capability failed the check.
+        provider: String,
+        /// The capability name whose description failed.
+        capability: String,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
 }
 
 /// A `Result` alias that defaults the error type to [`Error`].

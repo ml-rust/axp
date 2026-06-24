@@ -6,6 +6,8 @@
 //! - [`Workspace`] — canonical, absolute workspace root.
 //! - [`RuntimeCapability`] / [`CapabilitySet`] — structured, attenuable capability grants.
 //! - [`Session`] / [`SessionStore`] — runtime session lifecycle and in-memory store.
+//! - [`Provider`] / [`NativeProvider`] — runtime capability provider trait and in-memory impl.
+//! - [`ProviderRegistry`] — aggregates providers and serves the unified discovery catalog.
 //!
 //! # Security note
 //!
@@ -15,10 +17,14 @@
 
 mod capability;
 mod error;
+mod provider;
+mod registry;
 mod session;
 mod workspace;
 
 pub use capability::{CapabilitySet, RuntimeCapability};
 pub use error::{Error, Result};
+pub use provider::{CapabilityDescriptor, CapabilityListing, NativeProvider, Provider};
+pub use registry::ProviderRegistry;
 pub use session::{AuditEvent, AuditEventKind, Session, SessionStore};
 pub use workspace::Workspace;

@@ -10,6 +10,7 @@ authors.workspace = true
 [dependencies]
 axp-proto = { workspace = true }
 thiserror = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
