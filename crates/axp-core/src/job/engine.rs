@@ -867,7 +867,7 @@ mod tests {
         );
     }
 
-    // ── attach / status (U5c) ─────────────────────────────────────────────────
+    // ── attach / status ───────────────────────────────────────────────────────
 
     use axp_proto::{JobAttachRequest, JobStatusProto, JobStatusRequest, LogStreamProto};
 
@@ -1047,7 +1047,7 @@ mod tests {
         );
     }
 
-    // ── cancel ownership / session-close / audit (H0-U5d) ────────────────────
+    // ── cancel ownership / session-close / audit ─────────────────────────────
 
     #[tokio::test]
     async fn cancel_wrong_session_returns_not_found() {
@@ -1172,7 +1172,7 @@ mod tests {
         );
     }
 
-    // ── sandbox wiring (H0-U6d) ───────────────────────────────────────────────
+    // ── sandbox wiring ────────────────────────────────────────────────────────
 
     /// E2E confinement test: a `KernelLsm` job cannot read a file that lives
     /// outside the workspace tempdir.  A file in a SEPARATE tempdir is the

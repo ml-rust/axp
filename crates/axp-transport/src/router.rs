@@ -52,8 +52,8 @@ async fn rpc_handler(State(state): State<AppState>, body: axum::body::Bytes) -> 
 /// result of the handler (`Ok(Value)` or `Err(TransportError)`) is converted
 /// into a [`JsonRpcResponse`] with the echoed request id.
 ///
-/// `job.attach` is stubbed as `METHOD_NOT_FOUND` — it requires the SSE
-/// endpoint added in unit U7c.
+/// `job.attach` is stubbed as `METHOD_NOT_FOUND` — streaming attach is served
+/// over a dedicated SSE endpoint that is not yet implemented.
 ///
 /// The response id always echoes the request id (`null` when absent).
 pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse {
@@ -71,7 +71,7 @@ pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse 
                 id,
                 JsonRpcError {
                     code: METHOD_NOT_FOUND,
-                    message: "job.attach requires the SSE endpoint (added in U7c)".into(),
+                    message: "job.attach streaming is not yet available".into(),
                     data: None,
                 },
             );
@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_attach_returns_method_not_found_with_u7c_message() {
+    async fn job_attach_returns_method_not_found() {
         let state = make_state();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -179,8 +179,8 @@ mod tests {
             "expected METHOD_NOT_FOUND for job.attach: {s}"
         );
         assert!(
-            s.contains("U7c"),
-            "expected U7c reference in job.attach message: {s}"
+            s.contains("not yet available"),
+            "expected neutral unavailability message in job.attach response: {s}"
         );
     }
 }

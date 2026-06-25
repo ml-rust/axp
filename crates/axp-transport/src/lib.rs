@@ -2,7 +2,7 @@
 //!
 //! This crate provides the wire-protocol layer: envelope types, error mapping,
 //! shared application state, the axum router, and the six core JSON-RPC method
-//! handlers.  A server run-loop is added in unit U7d.
+//! handlers.  A server run-loop and streaming attach are not yet wired.
 
 mod error;
 mod handlers;

@@ -48,7 +48,7 @@ fn require_session(state: &AppState, id: &SessionId) -> Result<(), TransportErro
 /// new session id, opens the session in the store, and returns a
 /// [`SessionOpenResponse`] with the assigned id and granted tier.
 ///
-/// # TODO(H1)
+/// # TODO
 ///
 /// Replace `cap_token` with a real object-capability token and add
 /// cryptographic validation of tokens on subsequent calls.
@@ -60,7 +60,7 @@ pub(crate) async fn session_open(
     let workspace = Workspace::new(&req.workspace)?;
     let caps = CapabilitySet::from_wire(&req.capabilities)?;
     let id = state.next_session_id();
-    // TODO(H1): real object-capability token + validation
+    // TODO(auth): real object-capability token + validation (post-MVP)
     let resp = SessionOpenResponse {
         cap_token: id.0.clone(),
         session_id: id.clone(),
@@ -73,14 +73,14 @@ pub(crate) async fn session_open(
 /// Handle `axp.index`: return the full capability catalog for a session.
 ///
 /// The session id is validated (unknown → `NOT_FOUND`) but the registry is
-/// global for H0; it is not yet scoped per session.
+/// global for now; it is not yet scoped per session.
 pub(crate) async fn index(
     state: &AppState,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<IndexRequest>(params)?;
     require_session(state, &req.session_id)?;
-    // NOTE: registry is global for H0; session_id is validated but not yet session-scoped.
+    // NOTE: registry is global for now; session_id is validated but not yet session-scoped.
     let reg = state.registry.read().unwrap_or_else(|p| p.into_inner());
     let resp = reg.index()?;
     to_value(&resp)
@@ -96,7 +96,7 @@ pub(crate) async fn describe(
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<DescribeRequest>(params)?;
     require_session(state, &req.session_id)?;
-    // NOTE: registry is global for H0; session_id is validated but not yet session-scoped.
+    // NOTE: registry is global for now; session_id is validated but not yet session-scoped.
     let reg = state.registry.read().unwrap_or_else(|p| p.into_inner());
     let detail = reg.describe(&req.name)?;
     to_value(&detail)
@@ -336,7 +336,7 @@ mod tests {
         let v = call(&state, "job.attach", json!(null)).await;
         assert_eq!(
             v["error"]["code"], METHOD_NOT_FOUND,
-            "expected METHOD_NOT_FOUND for job.attach (deferred to U7c): {v}"
+            "expected METHOD_NOT_FOUND for job.attach (streaming not yet implemented): {v}"
         );
     }
 }
