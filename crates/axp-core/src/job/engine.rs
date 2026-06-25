@@ -36,17 +36,20 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
 use axp_proto::{
-    JobCancelRequest, JobCancelResponse, JobId, JobPayload, JobStartRequest, SessionId,
+    EnforcementTier, JobCancelRequest, JobCancelResponse, JobId, JobPayload, JobStartRequest,
+    SessionId,
 };
+use axp_sandbox::{SandboxError, SandboxPolicy};
 
 use crate::{
     Error, Result,
-    capability::RuntimeCapability,
+    capability::{CapabilitySet, RuntimeCapability},
     job::{
         DEFAULT_LOG_BYTE_CAP, Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
         resolve_cwd,
     },
     session::{AuditEventKind, SessionStore},
+    workspace::Workspace,
 };
 
 /// Read buffer size for draining a child's stdout/stderr pipes.
@@ -137,12 +140,6 @@ impl JobEngine {
         }
     }
 
-    /// Seam for the kernel-sandbox unit. A no-op today; the sandbox unit will configure
-    /// Landlock/seccomp/Seatbelt/AppContainer on the command before it is spawned.
-    fn apply_sandbox(_cmd: &mut tokio::process::Command, _cwd: &std::path::Path) -> Result<()> {
-        Ok(())
-    }
-
     /// Start a job: validate, spawn the child process, and launch the drainer.
     ///
     /// All synchronous validation (session lookup, capability checks, cwd
@@ -166,9 +163,9 @@ impl JobEngine {
             .sessions
             .get(&req.session_id)
             .ok_or_else(|| Error::SessionNotFound(req.session_id.clone()))?;
-        let (workspace, capabilities) = {
+        let (workspace, capabilities, tier) = {
             let s = session.read().unwrap_or_else(|p| p.into_inner());
-            (s.workspace.clone(), s.capabilities.clone())
+            (s.workspace.clone(), s.capabilities.clone(), s.tier)
         };
 
         // 2. Determine the command string from the payload, enforcing the
@@ -211,8 +208,12 @@ impl JobEngine {
             .stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
-        // 6. Sandbox seam (no-op today).
-        Self::apply_sandbox(&mut cmd, &cwd)?;
+        // 6. Build and apply the sandbox policy for this job's tier + capabilities.
+        let policy = build_sandbox_policy(tier, &workspace, &capabilities);
+        policy.apply(&mut cmd).map_err(|e| match e {
+            SandboxError::Unavailable { .. } => Error::SandboxUnavailable { source: e },
+            _ => Error::SandboxApply { source: e },
+        })?;
 
         // 7. Spawn. Only after a successful spawn do we create a Job.
         let mut child = cmd.spawn().map_err(|e| Error::JobSpawn {
@@ -522,6 +523,34 @@ impl JobEngine {
             pending: VecDeque::new(),
         })
     }
+}
+
+/// Build a [`SandboxPolicy`](axp_sandbox::SandboxPolicy) from a job's enforcement
+/// tier, its workspace, and the session's granted capabilities.
+///
+/// The workspace root is always readable. Verbs are orthogonal: `fs.read` grants
+/// add read paths, `fs.write` grants add write paths. `proc.spawn`/`net.connect`
+/// grants set the coarse spawn/network flags (domain-level egress filtering is a
+/// later unit). `pty.open`/`tool` grants are not filesystem/sandbox concerns here.
+fn build_sandbox_policy(
+    tier: EnforcementTier,
+    workspace: &Workspace,
+    capabilities: &CapabilitySet,
+) -> SandboxPolicy {
+    let mut fs_read = vec![workspace.root().to_path_buf()];
+    let mut fs_write = Vec::new();
+    let mut allow_proc_spawn = false;
+    let mut allow_network = false;
+    for cap in capabilities.grants() {
+        match cap {
+            RuntimeCapability::FsRead(p) => fs_read.push(p.clone()),
+            RuntimeCapability::FsWrite(p) => fs_write.push(p.clone()),
+            RuntimeCapability::NetConnect(_) => allow_network = true,
+            RuntimeCapability::ProcSpawn => allow_proc_spawn = true,
+            RuntimeCapability::PtyOpen | RuntimeCapability::Tool(_) => {}
+        }
+    }
+    SandboxPolicy::from_parts(tier, fs_read, fs_write, allow_proc_spawn, allow_network)
 }
 
 /// Convert a runtime [`LogStream`] to its wire form.
@@ -1140,6 +1169,93 @@ mod tests {
         assert!(
             finished,
             "expected a JobFinished(Exited{{code:0}}) audit event for {id:?}"
+        );
+    }
+
+    // ── sandbox wiring (H0-U6d) ───────────────────────────────────────────────
+
+    /// E2E confinement test: a `KernelLsm` job cannot read a file that lives
+    /// outside the workspace tempdir.  A file in a SEPARATE tempdir is the
+    /// secret — `/etc` is in the sandbox baseline read-allowlist so is NOT a
+    /// reliable oracle.  Only runs on Linux with Landlock available.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn kernel_lsm_confines_job_to_workspace() {
+        if !axp_sandbox::landlock_available() {
+            eprintln!("skipping: Landlock unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("workspace tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "TOPSECRET").expect("write secret");
+
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        let sessions = SessionStore::new();
+        let session_id = SessionId("s_lsm".into());
+        sessions.open(
+            session_id.clone(),
+            ws,
+            EnforcementTier::KernelLsm,
+            CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+        );
+        let engine = JobEngine::new(sessions, JobStore::new());
+
+        // Negative: secret outside the workspace must NOT be readable.
+        let req = command_req(&session_id, &format!("cat {}", secret.display()));
+        let id = engine.start(&req).await.expect("start under KernelLsm");
+        poll_terminal(&engine, &id).await;
+
+        let out = collected_bytes(&engine, &id, LogStream::Stdout);
+        assert!(
+            !out.windows(b"TOPSECRET".len()).any(|w| w == b"TOPSECRET"),
+            "secret outside the workspace leaked under KernelLsm: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+
+        // Positive: a file inside the workspace IS readable (workspace-root-always-readable).
+        let ok_file = dir.path().join("ok.txt");
+        std::fs::write(&ok_file, "OK").expect("write ok file");
+        let req2 = command_req(&session_id, &format!("cat {}", ok_file.display()));
+        let id2 = engine.start(&req2).await.expect("start workspace read");
+        poll_terminal(&engine, &id2).await;
+
+        let out2 = collected_bytes(&engine, &id2, LogStream::Stdout);
+        assert!(
+            out2.windows(b"OK".len()).any(|w| w == b"OK"),
+            "expected to read workspace file under KernelLsm, got {:?}",
+            String::from_utf8_lossy(&out2)
+        );
+        let handle2 = engine.jobs().get(&id2).expect("job2 present");
+        let status2 = handle2.read().unwrap().status.clone();
+        assert_eq!(
+            status2,
+            JobStatus::Exited { code: 0 },
+            "workspace cat should exit 0 under KernelLsm"
+        );
+    }
+
+    /// On non-Linux hosts, `KernelLsm` must FAIL job start with
+    /// `SandboxUnavailable` — never run unconfined.
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn kernel_lsm_on_non_linux_fails_job_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        let sessions = SessionStore::new();
+        let session_id = SessionId("s_lsm_nl".into());
+        sessions.open(
+            session_id.clone(),
+            ws,
+            EnforcementTier::KernelLsm,
+            CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+        );
+        let engine = JobEngine::new(sessions, JobStore::new());
+        let req = command_req(&session_id, "echo hi");
+        let result = engine.start(&req).await;
+        assert!(
+            matches!(result, Err(Error::SandboxUnavailable { .. })),
+            "expected SandboxUnavailable on non-Linux, got {result:?}"
         );
     }
 }

@@ -64,6 +64,7 @@ name = "axp-core"
 version = "0.0.0"
 dependencies = [
  "axp-proto",
+ "axp-sandbox",
  "bytes",
  "serde_json",
  "tempfile",

@@ -98,6 +98,21 @@ pub enum Error {
         /// The byte cap that was exceeded.
         cap: usize,
     },
+
+    /// The requested sandbox enforcement tier cannot be honored on this host;
+    /// the job is failed rather than run unconfined.
+    #[error("sandbox unavailable: {source}")]
+    SandboxUnavailable {
+        #[source]
+        source: axp_sandbox::SandboxError,
+    },
+
+    /// Applying the sandbox policy to the child process failed.
+    #[error("sandbox apply failed: {source}")]
+    SandboxApply {
+        #[source]
+        source: axp_sandbox::SandboxError,
+    },
 }
 
 /// A `Result` alias that defaults the error type to [`Error`].
