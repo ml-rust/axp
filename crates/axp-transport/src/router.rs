@@ -16,6 +16,15 @@ use crate::{
     state::AppState,
 };
 
+/// Bind `listener` and serve the AXP router until the process is terminated.
+///
+/// This is the single place that calls `axum::serve`, keeping `axum` an
+/// implementation detail of `axp-transport`.  Callers (e.g. `axp-cli`) bind
+/// the [`tokio::net::TcpListener`] and delegate to this function.
+pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
+    axum::serve(listener, build_router(state)).await
+}
+
 /// Build the axum [`Router`] for the AXP endpoints.
 ///
 /// Registers `POST /` for JSON-RPC 2.0 and `GET /job/attach` for the resumable
@@ -106,28 +115,13 @@ pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock, atomic::AtomicU64};
-
-    use axp_core::{JobEngine, JobStore, ProviderRegistry, SessionStore};
     use serde_json::json;
 
     use super::*;
-    use crate::jsonrpc::{INVALID_REQUEST, METHOD_NOT_FOUND};
-
-    fn make_state() -> AppState {
-        let sessions = SessionStore::new();
-        let engine = JobEngine::new(sessions.clone(), JobStore::new());
-        AppState {
-            sessions,
-            engine,
-            registry: Arc::new(RwLock::new(ProviderRegistry::new())),
-            session_counter: Arc::new(AtomicU64::new(1)),
-        }
-    }
 
     #[tokio::test]
     async fn completely_unknown_method_returns_method_not_found() {
-        let state = make_state();
+        let state = AppState::new();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(1)),
@@ -145,7 +139,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_id_echoes_request_id() {
-        let state = make_state();
+        let state = AppState::new();
         // Use a completely unknown method so the id-echo invariant is easy to
         // check without worrying about params decoding.
         let req = JsonRpcRequest {
@@ -160,7 +154,7 @@ mod tests {
 
     #[tokio::test]
     async fn null_id_when_request_has_no_id() {
-        let state = make_state();
+        let state = AppState::new();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: None,
@@ -173,7 +167,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_attach_directs_to_streaming_endpoint() {
-        let state = make_state();
+        let state = AppState::new();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(1)),

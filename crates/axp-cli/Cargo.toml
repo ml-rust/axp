@@ -15,7 +15,9 @@ name = "axp"
 path = "src/main.rs"
 
 [dependencies]
+axp-transport = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true
