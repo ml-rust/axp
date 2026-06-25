@@ -18,5 +18,14 @@ tokio = { workspace = true } # for the tokio::process::Command type in apply()'s
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
 
-[lints]
-workspace = true
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# This crate is the one place in the project permitted to use `unsafe` (the
+# `pre_exec` post-fork hook for Landlock enforcement). Mixing `workspace = true`
+# with overrides is not allowed, so the clippy lint group is restated here.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

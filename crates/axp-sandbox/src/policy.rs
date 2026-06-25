@@ -56,19 +56,28 @@ impl SandboxPolicy {
     /// Apply this policy to a child command before it is spawned.
     ///
     /// - `DevNone` → no-op, `Ok(())`.
-    /// - `KernelLsm` → in U6a this returns `Err(Unavailable { reason: "kernel-lsm enforcement not yet implemented" })`
-    ///   (real Landlock+seccomp lands in later units). It does NOT silently no-op — that would be false security.
+    /// - `KernelLsm` → on Linux, installs real Landlock filesystem enforcement on
+    ///   `cmd` via a `pre_exec` hook (see `crate::linux::enforce`). If Landlock is
+    ///   unavailable it returns `Err(Unavailable)` — it does NOT silently no-op,
+    ///   which would be false security. On non-Linux it returns `Err(Unavailable)`.
     /// - `Container` / `ProcessToken` → `Err(Unavailable)` (not supported on this backend).
-    ///
-    /// (The `_cmd` parameter is unused in U6a but fixes the signature so later
-    /// units fill in the `pre_exec` hook without an API change.)
-    pub fn apply(&self, _cmd: &mut tokio::process::Command) -> Result<(), SandboxError> {
+    pub fn apply(&self, cmd: &mut tokio::process::Command) -> Result<(), SandboxError> {
         match self.tier {
             EnforcementTier::DevNone => Ok(()),
-            EnforcementTier::KernelLsm => Err(SandboxError::Unavailable {
-                tier: self.tier,
-                reason: "kernel-lsm enforcement not yet implemented".into(),
-            }),
+            EnforcementTier::KernelLsm => {
+                #[cfg(target_os = "linux")]
+                {
+                    crate::linux::enforce(self, cmd)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = cmd;
+                    Err(SandboxError::Unavailable {
+                        tier: self.tier,
+                        reason: "kernel-lsm enforcement requires Linux".into(),
+                    })
+                }
+            }
             EnforcementTier::Container | EnforcementTier::ProcessToken => {
                 Err(SandboxError::Unavailable {
                     tier: self.tier,
@@ -115,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_kernel_lsm_is_unavailable() {
+    fn apply_kernel_lsm_matches_landlock_availability() {
         let mut cmd = tokio::process::Command::new("true");
         let policy = SandboxPolicy::from_parts(
             EnforcementTier::KernelLsm,
@@ -124,11 +133,21 @@ mod tests {
             false,
             false,
         );
-        match policy.apply(&mut cmd) {
-            Err(SandboxError::Unavailable { tier, .. }) => {
-                assert_eq!(tier, EnforcementTier::KernelLsm);
+        let result = policy.apply(&mut cmd);
+        if cfg!(target_os = "linux") && crate::landlock_available() {
+            // Landlock present: enforcement is installed, so apply succeeds.
+            assert!(
+                result.is_ok(),
+                "expected Ok with Landlock available, got {result:?}"
+            );
+        } else {
+            // No Landlock (or non-Linux): must fail loudly, never silently no-op.
+            match result {
+                Err(SandboxError::Unavailable { tier, .. }) => {
+                    assert_eq!(tier, EnforcementTier::KernelLsm);
+                }
+                other => panic!("expected Unavailable, got {other:?}"),
             }
-            other => panic!("expected Unavailable, got {other:?}"),
         }
     }
 
