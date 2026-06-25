@@ -8,6 +8,7 @@
 //! - [`Session`] / [`SessionStore`] — runtime session lifecycle and in-memory store.
 //! - [`Provider`] / [`NativeProvider`] — runtime capability provider trait and in-memory impl.
 //! - [`ProviderRegistry`] — aggregates providers and serves the unified discovery catalog.
+//! - [`builtin_registry`] — constructs the default registry pre-populated with built-in providers.
 //! - [`Job`] / [`JobStore`] — runtime job model, log buffering, and in-memory job store.
 //!
 //! # Security note
@@ -16,6 +17,7 @@
 //! only narrow (never broaden) authority, and verbs are strictly orthogonal.
 //! See [`capability`] for the full contract.
 
+mod builtins;
 mod capability;
 mod error;
 mod job;
@@ -24,6 +26,7 @@ mod registry;
 mod session;
 mod workspace;
 
+pub use builtins::builtin_registry;
 pub use capability::{CapabilitySet, RuntimeCapability};
 pub use error::{Error, Result};
 pub use job::{

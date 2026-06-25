@@ -215,18 +215,23 @@ mod tests {
     // ── axp.index ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn index_valid_session_returns_empty_entries() {
+    async fn index_valid_session_returns_builtin_entries() {
         let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let sid = open_session(&state, &dir).await;
 
         let v = call(&state, "axp.index", json!({ "session_id": sid.0 })).await;
-        let entries = &v["result"]["entries"];
-        assert!(entries.is_array(), "entries must be an array, got: {v}");
-        assert_eq!(
-            entries.as_array().unwrap().len(),
-            0,
-            "registry is empty; expected 0 entries"
+        let entries = v["result"]["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert!(
+            names.contains(&"git_diff"),
+            "expected git_diff in index: {names:?}"
+        );
+        assert!(
+            names.contains(&"git_log"),
+            "expected git_log in index: {names:?}"
         );
         let _dir = dir; // keep alive
     }

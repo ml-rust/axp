@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use axp_core::{JobEngine, JobStore, ProviderRegistry, SessionStore};
+use axp_core::{JobEngine, JobStore, ProviderRegistry, SessionStore, builtin_registry};
 use axp_proto::SessionId;
 
 /// Shared state for all axum request handlers.
@@ -37,9 +37,9 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Build a fresh, empty runtime state: a new session store, a job engine
-    /// over it (sharing the same store), an empty provider registry, and a
-    /// session-id counter starting at 1.
+    /// Build a fresh runtime state: a new session store, a job engine over it
+    /// (sharing the same store), a provider registry pre-populated with the
+    /// built-in capabilities, and a session-id counter starting at 1.
     ///
     /// This is the standard wiring used by the server and the tests.
     pub fn new() -> Self {
@@ -48,7 +48,7 @@ impl AppState {
         Self {
             sessions,
             engine,
-            registry: Arc::new(RwLock::new(ProviderRegistry::new())),
+            registry: Arc::new(RwLock::new(builtin_registry())),
             session_counter: Arc::new(AtomicU64::new(1)),
         }
     }
