@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::SystemTime;
 
-use axp_proto::{EnforcementTier, SessionId};
+use axp_proto::{EnforcementTier, JobId, JobStatusProto, SessionId};
 
 use crate::{Error, Result, capability::CapabilitySet, workspace::Workspace};
 
@@ -49,6 +49,18 @@ pub enum AuditEventKind {
     SessionOpened,
     /// The session was closed (capabilities revoked).
     SessionClosed,
+    /// A job was started in this session.
+    JobStarted {
+        /// The id of the job that started.
+        job_id: JobId,
+    },
+    /// A job in this session reached a terminal state.
+    JobFinished {
+        /// The id of the job that finished.
+        job_id: JobId,
+        /// The terminal status the job reached.
+        status: JobStatusProto,
+    },
 }
 
 // ── Session ───────────────────────────────────────────────────────────────────

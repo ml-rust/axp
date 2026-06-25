@@ -35,7 +35,9 @@ use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
-use axp_proto::{JobId, JobPayload, JobStartRequest, SessionId};
+use axp_proto::{
+    JobCancelRequest, JobCancelResponse, JobId, JobPayload, JobStartRequest, SessionId,
+};
 
 use crate::{
     Error, Result,
@@ -44,11 +46,19 @@ use crate::{
         DEFAULT_LOG_BYTE_CAP, Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
         resolve_cwd,
     },
-    session::SessionStore,
+    session::{AuditEventKind, SessionStore},
 };
 
 /// Read buffer size for draining a child's stdout/stderr pipes.
 const DRAIN_BUF_SIZE: usize = 8192;
+
+/// The per-job identity handed to the drainer task: the bits it needs to push
+/// logs, record audit events, and clean up its cancellation entry.
+struct JobTask {
+    job_id: JobId,
+    session_id: SessionId,
+    handle: Arc<RwLock<Job>>,
+}
 
 /// Runs jobs as child processes, capturing their output into each job's log buffer.
 ///
@@ -111,6 +121,20 @@ impl JobEngine {
     /// a logically broken state.
     fn cancels(&self) -> std::sync::MutexGuard<'_, HashMap<JobId, oneshot::Sender<()>>> {
         self.cancels.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Record an audit event on the owning session, if it still exists.
+    ///
+    /// A closed or removed session is silently skipped — jobs can outlive their
+    /// session and the drainer may fire the `JobFinished` event after the session
+    /// is gone.  This call is synchronous (no `.await`) and drops its lock guard
+    /// before returning, preserving the no-lock-across-await discipline.
+    fn record_session_audit(&self, session_id: &SessionId, kind: AuditEventKind) {
+        if let Some(s) = self.sessions.get(session_id) {
+            s.write()
+                .unwrap_or_else(|p| p.into_inner())
+                .record_audit(kind);
+        }
     }
 
     /// Seam for the kernel-sandbox unit. A no-op today; the sandbox unit will configure
@@ -207,16 +231,26 @@ impl JobEngine {
         let (cancel_tx, cancel_rx) = oneshot::channel();
         self.cancels().insert(id.clone(), cancel_tx);
 
+        // 9a. Record the JobStarted audit event now that the job truly exists.
+        self.record_session_audit(
+            &req.session_id,
+            AuditEventKind::JobStarted { job_id: id.clone() },
+        );
+
         // 10. Take the child's piped stdout/stderr.
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
         // 11. Spawn the drainer on the ambient runtime.
         let engine = self.clone();
-        let jid = id.clone();
+        let task = JobTask {
+            job_id: id.clone(),
+            session_id: req.session_id.clone(),
+            handle,
+        };
         tokio::spawn(async move {
             engine
-                .run_to_completion(jid, handle, child, stdout, stderr, cancel_rx)
+                .run_to_completion(task, child, stdout, stderr, cancel_rx)
                 .await;
         });
 
@@ -234,13 +268,17 @@ impl JobEngine {
     /// and marked `Failed`.
     async fn run_to_completion(
         &self,
-        job_id: JobId,
-        handle: Arc<RwLock<Job>>,
+        task: JobTask,
         mut child: tokio::process::Child,
         stdout: Option<tokio::process::ChildStdout>,
         stderr: Option<tokio::process::ChildStderr>,
         mut cancel_rx: oneshot::Receiver<()>,
     ) {
+        let JobTask {
+            job_id,
+            session_id,
+            handle,
+        } = task;
         let mut stdout = stdout;
         let mut stderr = stderr;
 
@@ -330,11 +368,21 @@ impl JobEngine {
         // returns `None` instead of hanging forever.
         let notify = {
             let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
-            job.status = final_status;
+            job.status = final_status.clone();
             job.finished_at = Some(SystemTime::now());
             job.log_buffer.subscribe()
         };
         notify.notify_waiters();
+
+        // Record the JobFinished audit event. This is a synchronous call that
+        // acquires and drops its lock guard internally — no .await is held.
+        self.record_session_audit(
+            &session_id,
+            AuditEventKind::JobFinished {
+                job_id: job_id.clone(),
+                status: final_status.into(),
+            },
+        );
 
         // Drop the cancellation sender; the job is finished.
         self.cancels().remove(&job_id);
@@ -355,10 +403,15 @@ impl JobEngine {
         Ok(())
     }
 
-    /// Request cancellation of a running job (best-effort SIGKILL via the drainer).
+    /// Send the cancellation signal for a job (best-effort SIGKILL via the drainer).
     ///
-    /// Returns `Err(JobNotFound)` if the job is unknown or already finished.
-    pub fn cancel(&self, job_id: &JobId) -> Result<()> {
+    /// Returns `Err(JobNotFound)` if the job's cancel sender is absent — i.e. the
+    /// job is unknown to the cancel table (either it never existed, or it already
+    /// finished and the drainer removed the sender).
+    ///
+    /// This is a private helper; callers must perform ownership checks before
+    /// invoking it.
+    fn kill_job(&self, job_id: &JobId) -> Result<()> {
         match self.cancels().remove(job_id) {
             Some(tx) => {
                 let _ = tx.send(());
@@ -366,6 +419,44 @@ impl JobEngine {
             }
             None => Err(Error::JobNotFound(job_id.clone())),
         }
+    }
+
+    /// Cancel a running job the caller owns (best-effort SIGKILL via the drainer).
+    ///
+    /// Returns `ok: true` if a running job was signalled, `ok: false` if the job
+    /// exists and is owned by the caller but already finished (nothing to cancel).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::JobNotFound`] if the job is unknown or owned by a different session.
+    pub fn cancel(&self, req: &JobCancelRequest) -> Result<JobCancelResponse> {
+        // Ownership check first: unknown or wrong-session → JobNotFound.
+        self.lookup_owned(&req.session_id, &req.job_id)?;
+        match self.kill_job(&req.job_id) {
+            Ok(()) => Ok(JobCancelResponse { ok: true }),
+            // Already finished (drainer removed the sender) — owned but done.
+            Err(Error::JobNotFound(_)) => Ok(JobCancelResponse { ok: false }),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Cancel all of a session's still-running jobs.
+    ///
+    /// Intended to be called by the session-close path BEFORE
+    /// `SessionStore::close` removes the session.
+    ///
+    /// Returns the number of jobs signalled. Jobs already finished are skipped.
+    /// This deliberately does not call `SessionStore::close` itself — wiring that
+    /// here would couple the engine to session lifecycle and risk a circular
+    /// dependency; the close handler is responsible for ordering.
+    pub fn cancel_for_session(&self, session_id: &SessionId) -> usize {
+        let mut n = 0;
+        for job_id in self.jobs.list_for_session(session_id) {
+            if self.kill_job(&job_id).is_ok() {
+                n += 1;
+            }
+        }
+        n
     }
 
     /// Look up a job and verify it belongs to `session_id`.
@@ -697,7 +788,12 @@ mod tests {
         let req = command_req(&h.session_id, "sleep 30");
         let id = h.engine.start(&req).await.expect("start");
         // Cancel immediately so the test stays fast.
-        h.engine.cancel(&id).expect("cancel a running job");
+        let cancel_req = axp_proto::JobCancelRequest {
+            session_id: h.session_id.clone(),
+            job_id: id.clone(),
+        };
+        let resp = h.engine.cancel(&cancel_req).expect("cancel");
+        assert!(resp.ok, "cancel should return ok=true for a running job");
         let status = poll_terminal(&h.engine, &id).await;
         assert_eq!(status, JobStatus::Killed);
     }
@@ -919,6 +1015,131 @@ mod tests {
             matches!(status.as_ref().err(), Some(Error::JobNotFound(_))),
             "expected JobNotFound for unknown job, got {:?}",
             status.map(|_| "ok")
+        );
+    }
+
+    // ── cancel ownership / session-close / audit (H0-U5d) ────────────────────
+
+    #[tokio::test]
+    async fn cancel_wrong_session_returns_not_found() {
+        let h = harness();
+        let req = command_req(&h.session_id, "sleep 30");
+        let id = h.engine.start(&req).await.expect("start");
+
+        // Use a completely different session id — ownership check must reject it.
+        let wrong = SessionId("s_wrong".into());
+        let cancel_req = axp_proto::JobCancelRequest {
+            session_id: wrong,
+            job_id: id.clone(),
+        };
+        let result = h.engine.cancel(&cancel_req);
+        assert!(
+            matches!(result, Err(Error::JobNotFound(_))),
+            "expected JobNotFound for wrong-session cancel, got {result:?}"
+        );
+
+        // Clean up: cancel the real job so the tokio task doesn't linger.
+        let real_req = axp_proto::JobCancelRequest {
+            session_id: h.session_id.clone(),
+            job_id: id.clone(),
+        };
+        let _ = h.engine.cancel(&real_req);
+        poll_terminal(&h.engine, &id).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_finished_job_returns_ok_false() {
+        let h = harness();
+        let req = command_req(&h.session_id, "echo hi");
+        let id = h.engine.start(&req).await.expect("start");
+        poll_terminal(&h.engine, &id).await;
+
+        // Job is finished — cancel should return ok=false (owned but already done).
+        let cancel_req = axp_proto::JobCancelRequest {
+            session_id: h.session_id.clone(),
+            job_id: id.clone(),
+        };
+        let resp = h
+            .engine
+            .cancel(&cancel_req)
+            .expect("cancel of finished job");
+        assert!(!resp.ok, "cancel of a finished job should return ok=false");
+    }
+
+    #[tokio::test]
+    async fn cancel_for_session_kills_all_running() {
+        let h = harness();
+        // Start 3 long-running jobs.
+        let id1 = h
+            .engine
+            .start(&command_req(&h.session_id, "sleep 30"))
+            .await
+            .expect("start 1");
+        let id2 = h
+            .engine
+            .start(&command_req(&h.session_id, "sleep 30"))
+            .await
+            .expect("start 2");
+        let id3 = h
+            .engine
+            .start(&command_req(&h.session_id, "sleep 30"))
+            .await
+            .expect("start 3");
+
+        let n = h.engine.cancel_for_session(&h.session_id);
+        assert_eq!(n, 3, "cancel_for_session must signal all 3 running jobs");
+
+        // All three must reach a terminal Killed state.
+        let s1 = poll_terminal(&h.engine, &id1).await;
+        let s2 = poll_terminal(&h.engine, &id2).await;
+        let s3 = poll_terminal(&h.engine, &id3).await;
+        assert_eq!(s1, JobStatus::Killed, "job 1 should be Killed");
+        assert_eq!(s2, JobStatus::Killed, "job 2 should be Killed");
+        assert_eq!(s3, JobStatus::Killed, "job 3 should be Killed");
+    }
+
+    #[tokio::test]
+    async fn audit_records_job_started_and_finished() {
+        use crate::session::AuditEventKind;
+
+        // Build the stores and engine manually so we retain a SessionStore handle
+        // to read audit events after the run (the Harness helper doesn't expose it).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        let sessions = SessionStore::new();
+        let session_id = SessionId("s_audit".into());
+        sessions.open(
+            session_id.clone(),
+            ws,
+            EnforcementTier::DevNone,
+            CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+        );
+        let jobs = JobStore::new();
+        let engine = JobEngine::new(sessions.clone(), jobs);
+
+        let req = command_req(&session_id, "echo hi");
+        let id = engine.start(&req).await.expect("start");
+        poll_terminal(&engine, &id).await;
+
+        // Read the session's audit log via the SessionStore we retained.
+        let session_arc = sessions.get(&session_id).expect("session must exist");
+        let session = session_arc.read().unwrap_or_else(|p| p.into_inner());
+        let events = session.audit_events();
+
+        // There must be a JobStarted event for this job id.
+        let started = events
+            .iter()
+            .any(|e| matches!(&e.kind, AuditEventKind::JobStarted { job_id } if job_id == &id));
+        assert!(started, "expected a JobStarted audit event for {id:?}");
+
+        // There must be a JobFinished event for this job id with Exited { code: 0 }.
+        let finished = events.iter().any(|e| {
+            matches!(&e.kind, AuditEventKind::JobFinished { job_id, status }
+                if job_id == &id && *status == JobStatusProto::Exited { code: 0 })
+        });
+        assert!(
+            finished,
+            "expected a JobFinished(Exited{{code:0}}) audit event for {id:?}"
         );
     }
 }
