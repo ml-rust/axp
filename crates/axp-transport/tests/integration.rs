@@ -6,27 +6,68 @@
 //!
 //! Only the crate's public API is used: `axp_transport::{AppState, serve}`.
 
+use std::sync::{Arc, RwLock, atomic::AtomicU64};
 use std::time::Duration;
+
+use axp_core::{
+    CapabilityArg, CapabilityDescriptor, ExecutionSpec, JobEngine, JobStore, NativeProvider,
+    ProviderRegistry, SessionStore,
+};
 
 /// Terminal `JobStatusProto` discriminant values; shared by the poll helpers.
 const TERMINAL_STATUSES: [&str; 3] = ["exited", "killed", "failed"];
 
 // ── Shared helpers ─────────────────────────────────────────────────────────────
 
+/// Spawn the server with a caller-supplied AppState; returns the base URL.
+async fn spawn_server_with(state: axp_transport::AppState) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = axp_transport::serve(listener, state).await;
+    });
+    format!("http://{addr}")
+}
+
 /// Bind an ephemeral port, spawn the AXP server as a background task, and
 /// return `(base_url, TempDir)`.  The `TempDir` is returned to keep the
 /// temporary workspace path alive for the duration of the test.
 async fn spawn_server() -> (String, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ephemeral port");
-    let addr = listener.local_addr().expect("local_addr");
-    let state = axp_transport::AppState::new();
-    tokio::spawn(async move {
-        let _ = axp_transport::serve(listener, state).await;
-    });
-    (format!("http://{addr}"), dir)
+    let base = spawn_server_with(axp_transport::AppState::new()).await;
+    (base, dir)
+}
+
+/// Build an AppState whose registry holds a single host-independent capability
+/// `say_hi` that runs `echo hi`.
+fn echo_cap_state() -> axp_transport::AppState {
+    let descriptor = CapabilityDescriptor {
+        name: "say_hi".to_string(),
+        desc: "Print a fixed greeting line for tests".to_string(),
+        signature: "say_hi(): string".to_string(),
+        schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+        exec: ExecutionSpec {
+            program: "echo".to_string(),
+            args_template: vec![CapabilityArg::Literal("hi".to_string())],
+        },
+    };
+    let provider = NativeProvider::new("test", vec![descriptor]).expect("valid descriptor");
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register(Box::new(provider))
+        .expect("register test provider");
+    let registry = Arc::new(RwLock::new(registry));
+
+    let sessions = SessionStore::new();
+    let engine = JobEngine::new(sessions.clone(), JobStore::new(), Arc::clone(&registry));
+    axp_transport::AppState {
+        sessions,
+        engine,
+        registry,
+        session_counter: Arc::new(AtomicU64::new(1)),
+    }
 }
 
 /// POST a JSON-RPC 2.0 request to `{base}/` and return the parsed response body.
@@ -410,4 +451,187 @@ async fn unknown_session_index_returns_jsonrpc_not_found() {
         axp_transport::NOT_FOUND,
         "expected NOT_FOUND (-32001), got code: {code} in response: {resp}"
     );
+}
+
+// ── Test: capability invocation over HTTP runs and streams output ──────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capability_invocation_over_http_runs_and_streams() {
+    let base = spawn_server_with(echo_cap_state()).await;
+    let client = reqwest::Client::new();
+    // The workspace directory must exist; echo doesn't use it, but session.open validates it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    // ── 1. session.open with tool:say_hi grant ─────────────────────────────────
+    let open = rpc(
+        &client,
+        &base,
+        "session.open",
+        serde_json::json!({
+            "workspace": workspace,
+            "sandbox_tier": "dev-none",
+            "capabilities": ["tool:say_hi"],
+        }),
+    )
+    .await;
+    assert!(
+        open.get("error").is_none(),
+        "session.open returned error: {open}"
+    );
+    let sid = open["result"]["session_id"]
+        .as_str()
+        .expect("session_id string")
+        .to_owned();
+
+    // ── 2. job.start — invoke the say_hi capability ────────────────────────────
+    let start = rpc(
+        &client,
+        &base,
+        "job.start",
+        serde_json::json!({
+            "session_id": sid,
+            "kind": "capability",
+            "name": "say_hi",
+            "params": {},
+        }),
+    )
+    .await;
+    assert!(
+        start.get("error").is_none(),
+        "job.start returned error: {start}"
+    );
+    let jid = start["result"]["job_id"]
+        .as_str()
+        .expect("job_id string")
+        .to_owned();
+
+    // ── 3. Poll job.status until terminal ─────────────────────────────────────
+    let mut became_terminal = false;
+    for _ in 0..100 {
+        let status_resp = rpc(
+            &client,
+            &base,
+            "job.status",
+            serde_json::json!({"session_id": sid, "job_id": jid}),
+        )
+        .await;
+        assert!(
+            status_resp.get("error").is_none(),
+            "job.status returned error: {status_resp}"
+        );
+        let discriminant = status_resp["result"]["status"]["status"]
+            .as_str()
+            .unwrap_or("");
+        if TERMINAL_STATUSES.contains(&discriminant) {
+            became_terminal = true;
+            // Assert the job exited successfully with code 0.
+            assert_eq!(
+                discriminant, "exited",
+                "expected exited, got: {status_resp}"
+            );
+            let exit_code = status_resp["result"]["status"]["code"]
+                .as_i64()
+                .expect("code must be integer");
+            assert_eq!(exit_code, 0, "expected exit code 0, got: {exit_code}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_terminal,
+        "say_hi job {jid} did not reach a terminal state within the polling timeout"
+    );
+
+    // ── 4. GET /job/attach — finite SSE replay must contain "hi" ──────────────
+    // Poll to terminal before attaching so the stream drains and closes (safe to call .text()).
+    let attach_resp = client
+        .get(format!("{base}/job/attach?session_id={sid}&job_id={jid}"))
+        .send()
+        .await
+        .expect("GET /job/attach");
+    assert_eq!(attach_resp.status(), 200, "attach must return 200");
+    let ctype = attach_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ctype.contains("text/event-stream"),
+        "content-type must be text/event-stream, got: {ctype}"
+    );
+    let body = attach_resp.text().await.expect("attach body text");
+    let log_bytes = collected_log_bytes(&body);
+    let log_text = String::from_utf8_lossy(&log_bytes);
+    assert!(
+        log_text.contains("hi"),
+        "decoded log must contain 'hi', got: {log_text:?} (raw body: {body})"
+    );
+
+    let _dir = dir; // keep TempDir alive until end of test
+}
+
+// ── Test: capability invocation without grant is denied (-32002) ───────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capability_invocation_without_grant_is_denied_over_http() {
+    let base = spawn_server_with(echo_cap_state()).await;
+    let client = reqwest::Client::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    // session.open with NO capabilities granted.
+    let open = rpc(
+        &client,
+        &base,
+        "session.open",
+        serde_json::json!({
+            "workspace": workspace,
+            "sandbox_tier": "dev-none",
+            "capabilities": [],
+        }),
+    )
+    .await;
+    assert!(
+        open.get("error").is_none(),
+        "session.open returned error: {open}"
+    );
+    let sid = open["result"]["session_id"]
+        .as_str()
+        .expect("session_id string")
+        .to_owned();
+
+    // job.start capability invocation — must be denied because tool:say_hi is not granted.
+    let start = rpc(
+        &client,
+        &base,
+        "job.start",
+        serde_json::json!({
+            "session_id": sid,
+            "kind": "capability",
+            "name": "say_hi",
+            "params": {},
+        }),
+    )
+    .await;
+
+    // Must return a JSON-RPC error with DENIED code (-32002).
+    assert!(
+        start.get("error").is_some(),
+        "expected JSON-RPC error for denied capability, got: {start}"
+    );
+    assert!(
+        start.get("result").is_none(),
+        "must not have result when error is present: {start}"
+    );
+    let code = start["error"]["code"]
+        .as_i64()
+        .expect("error.code must be an integer");
+    assert_eq!(
+        code,
+        axp_transport::DENIED,
+        "expected DENIED (-32002), got code: {code} in response: {start}"
+    );
+
+    let _dir = dir; // keep TempDir alive until end of test
 }
