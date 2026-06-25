@@ -146,9 +146,6 @@ pub(crate) async fn job_cancel(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock, atomic::AtomicU64};
-
-    use axp_core::{JobEngine, JobStore, ProviderRegistry, SessionStore};
     use axp_proto::SessionId;
     use serde_json::{Value, json};
 
@@ -160,19 +157,6 @@ mod tests {
         },
         router::dispatch,
     };
-
-    // ── test helpers ──────────────────────────────────────────────────────────
-
-    fn make_state() -> AppState {
-        let sessions = SessionStore::new();
-        let engine = JobEngine::new(sessions.clone(), JobStore::new());
-        AppState {
-            sessions,
-            engine,
-            registry: Arc::new(RwLock::new(ProviderRegistry::new())),
-            session_counter: Arc::new(AtomicU64::new(1)),
-        }
-    }
 
     /// Call `dispatch` and return the JSON-serialized response as a `Value`.
     async fn call(state: &AppState, method: &str, params: Value) -> Value {
@@ -211,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_open_returns_session_id_with_s_prefix() {
-        let state = make_state();
+        let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let v = call(
             &state,
@@ -232,7 +216,7 @@ mod tests {
 
     #[tokio::test]
     async fn index_valid_session_returns_empty_entries() {
-        let state = make_state();
+        let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let sid = open_session(&state, &dir).await;
 
@@ -249,7 +233,7 @@ mod tests {
 
     #[tokio::test]
     async fn index_unknown_session_returns_not_found() {
-        let state = make_state();
+        let state = AppState::new();
         let v = call(&state, "axp.index", json!({ "session_id": "s_unknown" })).await;
         assert_eq!(
             v["error"]["code"], NOT_FOUND,
@@ -261,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn describe_unknown_capability_returns_not_found() {
-        let state = make_state();
+        let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let sid = open_session(&state, &dir).await;
 
@@ -282,7 +266,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_start_returns_job_id() {
-        let state = make_state();
+        let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let sid = open_session(&state, &dir).await;
 
@@ -308,7 +292,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_start_malformed_params_returns_invalid_params() {
-        let state = make_state();
+        let state = AppState::new();
         let v = call(
             &state,
             "job.start",
@@ -325,7 +309,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_method_returns_method_not_found() {
-        let state = make_state();
+        let state = AppState::new();
         let v = call(&state, "frobnicate", json!(null)).await;
         assert_eq!(
             v["error"]["code"], METHOD_NOT_FOUND,
@@ -335,7 +319,7 @@ mod tests {
 
     #[tokio::test]
     async fn job_attach_directs_to_streaming_endpoint() {
-        let state = make_state();
+        let state = AppState::new();
         let v = call(&state, "job.attach", json!(null)).await;
         assert_eq!(
             v["error"]["code"], INVALID_REQUEST,

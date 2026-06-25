@@ -150,30 +150,15 @@ pub(crate) async fn attach_sse(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock, atomic::AtomicU64};
     use std::time::Duration;
 
-    use axp_core::{
-        CapabilitySet, JobEngine, JobStore, ProviderRegistry, RuntimeCapability, SessionStore,
-        Workspace,
-    };
+    use axp_core::{CapabilitySet, RuntimeCapability, Workspace};
     use axp_proto::{EnforcementTier, JobId, JobPayload, JobStartRequest, SessionId};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
     use crate::{router::build_router, state::AppState};
-
-    fn make_state() -> AppState {
-        let sessions = SessionStore::new();
-        let engine = JobEngine::new(sessions.clone(), JobStore::new());
-        AppState {
-            sessions,
-            engine,
-            registry: Arc::new(RwLock::new(ProviderRegistry::new())),
-            session_counter: Arc::new(AtomicU64::new(1)),
-        }
-    }
 
     /// Poll a job to a terminal state so the SSE stream is finite (bounded ~5s).
     async fn poll_terminal(state: &AppState, id: &JobId) {
@@ -196,7 +181,7 @@ mod tests {
     /// Build a `dev-none` session with `proc.spawn` over a tempdir, start an
     /// `echo hello` job, poll it to terminal, and return `(state, sid, jid, dir)`.
     async fn finished_job() -> (AppState, SessionId, JobId, tempfile::TempDir) {
-        let state = make_state();
+        let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let ws = Workspace::new(dir.path()).expect("workspace");
         let sid = SessionId("s_attach".into());

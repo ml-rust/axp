@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use axp_core::{JobEngine, ProviderRegistry, SessionStore};
+use axp_core::{JobEngine, JobStore, ProviderRegistry, SessionStore};
 use axp_proto::SessionId;
 
 /// Shared state for all axum request handlers.
@@ -37,6 +37,22 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Build a fresh, empty runtime state: a new session store, a job engine
+    /// over it (sharing the same store), an empty provider registry, and a
+    /// session-id counter starting at 1.
+    ///
+    /// This is the standard wiring used by the server and the tests.
+    pub fn new() -> Self {
+        let sessions = SessionStore::new();
+        let engine = JobEngine::new(sessions.clone(), JobStore::new());
+        Self {
+            sessions,
+            engine,
+            registry: Arc::new(RwLock::new(ProviderRegistry::new())),
+            session_counter: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
     /// Atomically allocate the next session id and return it formatted as
     /// `s_<n>`.
     ///
@@ -48,28 +64,22 @@ impl AppState {
     }
 }
 
+impl Default for AppState {
+    /// Delegates to [`AppState::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use axp_core::{JobStore, SessionStore};
-
     use super::*;
-
-    fn make_state() -> AppState {
-        let sessions = SessionStore::new();
-        let engine = JobEngine::new(sessions.clone(), JobStore::new());
-        AppState {
-            sessions,
-            engine,
-            registry: Arc::new(RwLock::new(ProviderRegistry::new())),
-            session_counter: Arc::new(AtomicU64::new(1)),
-        }
-    }
 
     #[test]
     fn next_session_id_is_unique_and_prefixed() {
-        let state = make_state();
+        let state = AppState::new();
         let id1 = state.next_session_id();
         let id2 = state.next_session_id();
         assert!(
@@ -82,14 +92,14 @@ mod tests {
 
     #[test]
     fn next_session_id_starts_at_one() {
-        let state = make_state();
+        let state = AppState::new();
         let id = state.next_session_id();
         assert_eq!(id.as_str(), "s_1");
     }
 
     #[test]
     fn clone_shares_counter() {
-        let state = make_state();
+        let state = AppState::new();
         let clone = state.clone();
         let _id1 = state.next_session_id(); // consumes 1
         let id2 = clone.next_session_id(); // should consume 2
