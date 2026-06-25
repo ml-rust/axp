@@ -351,7 +351,7 @@ mod tests {
                 name: "cat_file".to_string(),
                 desc: "Print the contents of the named file".to_string(),
                 signature: "cat_file(path: string): string".to_string(),
-                schema: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+                schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}),
                 exec: ExecutionSpec {
                     program: "cat".into(),
                     args_template: vec![CapabilityArg::Param("path".into())],

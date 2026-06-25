@@ -46,6 +46,16 @@ fn native_provider() -> NativeProvider {
                 ],
             },
         },
+        CapabilityDescriptor {
+            name: "read_file".to_string(),
+            desc: "Read and output the contents of a file by path".to_string(),
+            signature: "read_file(path: string): string".to_string(),
+            schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}),
+            exec: ExecutionSpec {
+                program: "cat".into(),
+                args_template: vec![CapabilityArg::Param("path".into())],
+            },
+        },
     ];
     NativeProvider::new("native", descriptors).expect("built-in capability names are unique")
 }
@@ -56,7 +66,7 @@ mod tests {
     use crate::Error;
 
     #[test]
-    fn builtin_registry_index_contains_both_capabilities() {
+    fn builtin_registry_index_contains_git_diff_and_git_log() {
         let registry = builtin_registry();
         let resp = registry.index().unwrap();
         let mut names: Vec<&str> = resp.entries.iter().map(|e| e.name.as_str()).collect();
@@ -69,6 +79,24 @@ mod tests {
             names.contains(&"git_log"),
             "expected git_log in index: {names:?}"
         );
+    }
+
+    #[test]
+    fn builtin_registry_index_contains_read_file() {
+        let registry = builtin_registry();
+        let resp = registry.index().unwrap();
+        let names: Vec<&str> = resp.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"read_file"),
+            "expected read_file in index: {names:?}"
+        );
+    }
+
+    #[test]
+    fn builtin_registry_describe_read_file_returns_correct_signature() {
+        let registry = builtin_registry();
+        let detail = registry.describe("read_file").unwrap();
+        assert_eq!(detail.signature, "read_file(path: string): string");
     }
 
     #[test]
