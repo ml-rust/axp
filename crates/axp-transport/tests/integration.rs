@@ -40,19 +40,10 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
     (base, dir)
 }
 
-/// Build an AppState whose registry holds a single host-independent capability
-/// `say_hi` that runs `echo hi`.
-fn echo_cap_state() -> axp_transport::AppState {
-    let descriptor = CapabilityDescriptor {
-        name: "say_hi".to_string(),
-        desc: "Print a fixed greeting line for tests".to_string(),
-        signature: "say_hi(): string".to_string(),
-        schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
-        exec: ExecutionSpec {
-            program: "echo".to_string(),
-            args_template: vec![CapabilityArg::Literal("hi".to_string())],
-        },
-    };
+/// Build an [`axp_transport::AppState`] whose registry holds exactly the given
+/// capability descriptor on a `"test"` provider.  Used by test-specific
+/// `*_state()` helpers to avoid duplicating the construction boilerplate.
+fn cap_state(descriptor: CapabilityDescriptor) -> axp_transport::AppState {
     let provider = NativeProvider::new("test", vec![descriptor]).expect("valid descriptor");
     let mut registry = ProviderRegistry::new();
     registry
@@ -68,6 +59,35 @@ fn echo_cap_state() -> axp_transport::AppState {
         registry,
         session_counter: Arc::new(AtomicU64::new(1)),
     }
+}
+
+/// Build an AppState whose registry holds a single host-independent capability
+/// `say_hi` that runs `echo hi`.
+fn echo_cap_state() -> axp_transport::AppState {
+    cap_state(CapabilityDescriptor {
+        name: "say_hi".to_string(),
+        desc: "Print a fixed greeting line for tests".to_string(),
+        signature: "say_hi(): string".to_string(),
+        schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+        exec: ExecutionSpec {
+            program: "echo".to_string(),
+            args_template: vec![CapabilityArg::Literal("hi".to_string())],
+        },
+    })
+}
+
+/// Build an AppState whose registry holds the `read_file` capability (`cat <path>`).
+fn read_file_cap_state() -> axp_transport::AppState {
+    cap_state(CapabilityDescriptor {
+        name: "read_file".to_string(),
+        desc: "Read and output the contents of a file by path".to_string(),
+        signature: "read_file(path: string): string".to_string(),
+        schema: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}),
+        exec: ExecutionSpec {
+            program: "cat".to_string(),
+            args_template: vec![CapabilityArg::Param("path".to_string())],
+        },
+    })
 }
 
 /// POST a JSON-RPC 2.0 request to `{base}/` and return the parsed response body.
@@ -566,6 +586,123 @@ async fn capability_invocation_over_http_runs_and_streams() {
     assert!(
         log_text.contains("hi"),
         "decoded log must contain 'hi', got: {log_text:?} (raw body: {body})"
+    );
+
+    let _dir = dir; // keep TempDir alive until end of test
+}
+
+// ── Test: read_file capability reads a known file over HTTP ───────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn read_file_capability_reads_file_contents_over_http() {
+    use std::io::Write as _;
+
+    let base = spawn_server_with(read_file_cap_state()).await;
+    let client = reqwest::Client::new();
+
+    // Write a file with known contents inside a tempdir workspace.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file_path = dir.path().join("axp_read_file_test.txt");
+    {
+        let mut f = std::fs::File::create(&file_path).expect("create test file");
+        f.write_all(b"Hello from read_file test")
+            .expect("write test file");
+    }
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+    let abs_path = file_path.to_str().expect("file path utf-8").to_owned();
+
+    // ── 1. session.open with tool:read_file grant ─────────────────────────────
+    let open = rpc(
+        &client,
+        &base,
+        "session.open",
+        serde_json::json!({
+            "workspace": workspace,
+            "sandbox_tier": "dev-none",
+            "capabilities": ["tool:read_file"],
+        }),
+    )
+    .await;
+    assert!(
+        open.get("error").is_none(),
+        "session.open returned error: {open}"
+    );
+    let sid = open["result"]["session_id"]
+        .as_str()
+        .expect("session_id string")
+        .to_owned();
+
+    // ── 2. job.start — invoke read_file with the path param ───────────────────
+    let start = rpc(
+        &client,
+        &base,
+        "job.start",
+        serde_json::json!({
+            "session_id": sid,
+            "kind": "capability",
+            "name": "read_file",
+            "params": {"path": abs_path},
+        }),
+    )
+    .await;
+    assert!(
+        start.get("error").is_none(),
+        "job.start returned error: {start}"
+    );
+    let jid = start["result"]["job_id"]
+        .as_str()
+        .expect("job_id string")
+        .to_owned();
+
+    // ── 3. Poll job.status until terminal ────────────────────────────────────
+    let mut became_terminal = false;
+    for _ in 0..100 {
+        let status_resp = rpc(
+            &client,
+            &base,
+            "job.status",
+            serde_json::json!({"session_id": sid, "job_id": jid}),
+        )
+        .await;
+        assert!(
+            status_resp.get("error").is_none(),
+            "job.status returned error: {status_resp}"
+        );
+        let discriminant = status_resp["result"]["status"]["status"]
+            .as_str()
+            .unwrap_or("");
+        if TERMINAL_STATUSES.contains(&discriminant) {
+            became_terminal = true;
+            assert_eq!(
+                discriminant, "exited",
+                "expected exited, got: {status_resp}"
+            );
+            let exit_code = status_resp["result"]["status"]["code"]
+                .as_i64()
+                .expect("code must be integer");
+            assert_eq!(exit_code, 0, "expected exit code 0, got: {exit_code}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_terminal,
+        "read_file job {jid} did not reach a terminal state within the polling timeout"
+    );
+
+    // ── 4. GET /job/attach — SSE replay must contain the file contents ────────
+    let attach_resp = client
+        .get(format!("{base}/job/attach?session_id={sid}&job_id={jid}"))
+        .send()
+        .await
+        .expect("GET /job/attach");
+    assert_eq!(attach_resp.status(), 200, "attach must return 200");
+    let body = attach_resp.text().await.expect("attach body text");
+    let log_bytes = collected_log_bytes(&body);
+    let log_text = String::from_utf8_lossy(&log_bytes);
+    assert!(
+        log_text.contains("Hello from read_file test"),
+        "decoded log must contain file contents, got: {log_text:?} (raw body: {body})"
     );
 
     let _dir = dir; // keep TempDir alive until end of test
