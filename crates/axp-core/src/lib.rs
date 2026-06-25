@@ -33,7 +33,10 @@ pub use job::{
     DEFAULT_LOG_BYTE_CAP, Job, JobEngine, JobLogStream, JobStatus, JobStore, LogBuffer, LogEvent,
     LogStream, Seq, resolve_cwd,
 };
-pub use provider::{CapabilityDescriptor, CapabilityListing, NativeProvider, Provider};
+pub use provider::{
+    CapabilityArg, CapabilityDescriptor, CapabilityListing, ExecutionSpec, NativeProvider,
+    Provider, ResolvedCommand,
+};
 pub use registry::ProviderRegistry;
 pub use session::{AuditEvent, AuditEventKind, Session, SessionStore};
 pub use workspace::Workspace;

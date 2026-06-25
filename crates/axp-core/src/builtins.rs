@@ -1,6 +1,9 @@
 //! Built-in capability providers wired into every runtime by default.
 
-use crate::{CapabilityDescriptor, NativeProvider, ProviderRegistry};
+use crate::{
+    CapabilityDescriptor, NativeProvider, ProviderRegistry,
+    provider::{CapabilityArg, ExecutionSpec},
+};
 
 /// Build a [`ProviderRegistry`] pre-populated with the built-in providers.
 ///
@@ -15,8 +18,8 @@ pub fn builtin_registry() -> ProviderRegistry {
     registry
 }
 
-/// The default in-process "native" provider. DISCOVERY-ONLY for now: descriptors
-/// carry name/desc/signature/schema; execution wiring lands in a later unit.
+/// The default in-process "native" provider. Descriptors carry name/desc/signature/schema
+/// and an [`ExecutionSpec`] used by the engine's capability resolver.
 fn native_provider() -> NativeProvider {
     let descriptors = vec![
         CapabilityDescriptor {
@@ -24,12 +27,24 @@ fn native_provider() -> NativeProvider {
             desc: "Show uncommitted working-tree changes as a unified diff".to_string(),
             signature: "git_diff(): string".to_string(),
             schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+            exec: ExecutionSpec {
+                program: "git".into(),
+                args_template: vec![CapabilityArg::Literal("diff".into())],
+            },
         },
         CapabilityDescriptor {
             name: "git_log".to_string(),
             desc: "List recent commits in compact one-line summary form".to_string(),
             signature: "git_log(): string".to_string(),
             schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
+            exec: ExecutionSpec {
+                program: "git".into(),
+                args_template: vec![
+                    CapabilityArg::Literal("log".into()),
+                    CapabilityArg::Literal("--oneline".into()),
+                    CapabilityArg::Literal("-20".into()),
+                ],
+            },
         },
     ];
     NativeProvider::new("native", descriptors).expect("built-in capability names are unique")

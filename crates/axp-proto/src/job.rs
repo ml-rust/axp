@@ -3,9 +3,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Capability, JobId, SessionId};
 
-/// The work a job runs: a shell command, or a code submission (code-mode).
+/// The work a job runs: a shell command, a code submission, or a named capability invocation.
 /// Internally tagged on `kind` so the receiver knows the execution path.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally absent: the `Capability` variant holds `serde_json::Value`, which
+/// is `PartialEq` but not `Eq`. `assert_eq!` only requires `PartialEq`, so existing tests
+/// are unaffected.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JobPayload {
     /// A shell command string.
@@ -22,10 +26,21 @@ pub enum JobPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         lang: Option<String>,
     },
+    /// Invoke a named capability from the registry with JSON params. Resolved by
+    /// the engine into an argv command and run under the session's sandbox.
+    Capability {
+        /// The registry-exposed capability name (e.g. `"git_diff"`).
+        name: String,
+        /// JSON params object passed to the capability's resolver.
+        params: serde_json::Value,
+    },
 }
 
 /// `job.start` request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is absent because the embedded [`JobPayload`] contains `serde_json::Value` via
+/// the `Capability` variant, which is `PartialEq` but not `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JobStartRequest {
     /// The session this job runs within.
     pub session_id: SessionId,
@@ -333,5 +348,24 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let resp2: JobCancelResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, resp2);
+    }
+
+    #[test]
+    fn job_payload_capability_round_trips() {
+        let req = JobStartRequest {
+            session_id: SessionId("s_1".into()),
+            payload: JobPayload::Capability {
+                name: "git_diff".into(),
+                params: serde_json::json!({}),
+            },
+            cwd: None,
+            capabilities: vec![],
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["kind"], "capability");
+        assert_eq!(value["name"], "git_diff");
+        assert_eq!(value["params"], serde_json::json!({}));
+        let req2: JobStartRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(req, req2);
     }
 }

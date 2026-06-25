@@ -182,6 +182,9 @@ impl JobEngine {
             JobPayload::Code { .. } => {
                 return Err(Error::NotImplemented("code-mode execution"));
             }
+            JobPayload::Capability { .. } => {
+                return Err(Error::NotImplemented("capability invocation"));
+            }
         };
 
         // 3. Resolve the working directory against the workspace.
@@ -808,6 +811,25 @@ mod tests {
         assert!(
             matches!(result, Err(Error::NotImplemented(_))),
             "expected NotImplemented, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_payload_not_implemented() {
+        let h = harness();
+        let req = JobStartRequest {
+            session_id: h.session_id.clone(),
+            payload: JobPayload::Capability {
+                name: "git_diff".into(),
+                params: serde_json::json!({}),
+            },
+            cwd: None,
+            capabilities: vec![],
+        };
+        let result = h.engine.start(&req).await;
+        assert!(
+            matches!(result, Err(Error::NotImplemented(_))),
+            "expected NotImplemented for capability payload, got {result:?}"
         );
     }
 

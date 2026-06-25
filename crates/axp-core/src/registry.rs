@@ -13,7 +13,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::{Error, Result, provider::Provider};
+use crate::{
+    Error, Result,
+    provider::{Provider, ResolvedCommand},
+};
 
 /// Minimum allowed length (in bytes) for a capability description.
 const DESC_MIN_LEN: usize = 10;
@@ -179,6 +182,31 @@ impl ProviderRegistry {
 
         provider.describe(&entry.local_name)
     }
+
+    /// Resolve a capability by its exposed catalog name to a concrete argv command,
+    /// routing to the owning provider (the bare local name is passed through, like
+    /// [`describe`](Self::describe)).
+    ///
+    /// Returns [`Error::CapabilityNotFound`] if the name is unknown, or propagates
+    /// [`Error::CapabilityParse`] from the provider if a required param is missing or
+    /// non-string.
+    pub fn resolve(&self, name: &str, params: &serde_json::Value) -> Result<ResolvedCommand> {
+        let entry = self
+            .catalog
+            .get(name)
+            .ok_or_else(|| Error::CapabilityNotFound {
+                name: name.to_owned(),
+            })?;
+
+        let provider =
+            self.providers
+                .get(&entry.provider_id)
+                .ok_or_else(|| Error::CapabilityNotFound {
+                    name: name.to_owned(),
+                })?;
+
+        provider.resolve(&entry.local_name, params)
+    }
 }
 
 impl Default for ProviderRegistry {
@@ -243,7 +271,9 @@ fn check_description_quality(provider: &str, cap_name: &str, desc: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{CapabilityDescriptor, CapabilityListing, NativeProvider};
+    use crate::provider::{
+        CapabilityArg, CapabilityDescriptor, CapabilityListing, ExecutionSpec, NativeProvider,
+    };
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -253,6 +283,10 @@ mod tests {
             desc: desc.to_string(),
             signature: sig.to_string(),
             schema: serde_json::json!({"type": "object"}),
+            exec: ExecutionSpec {
+                program: "true".into(),
+                args_template: vec![],
+            },
         }
     }
 
@@ -652,5 +686,55 @@ mod tests {
                 name: local_name.to_owned(),
             })
         }
+
+        fn resolve(
+            &self,
+            local_name: &str,
+            _params: &serde_json::Value,
+        ) -> Result<crate::provider::ResolvedCommand> {
+            Err(Error::CapabilityNotFound {
+                name: local_name.to_owned(),
+            })
+        }
+    }
+
+    // ── registry resolve ──────────────────────────────────────────────────────
+
+    fn native_with_git_diff() -> Box<dyn Provider> {
+        let descriptors = vec![CapabilityDescriptor {
+            name: "git_diff".to_string(),
+            desc: "Show uncommitted changes as a patch diff".to_string(),
+            signature: "git_diff(): string".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            exec: ExecutionSpec {
+                program: "git".into(),
+                args_template: vec![CapabilityArg::Literal("diff".into())],
+            },
+        }];
+        Box::new(NativeProvider::new("native", descriptors).expect("unique descriptor"))
+    }
+
+    #[test]
+    fn registry_resolve_known_capability_returns_correct_command() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(native_with_git_diff()).unwrap();
+        let cmd = reg
+            .resolve("git_diff", &serde_json::json!({}))
+            .expect("resolve must succeed");
+        assert_eq!(cmd.program, "git");
+        assert_eq!(cmd.args, vec!["diff"]);
+    }
+
+    #[test]
+    fn registry_resolve_unknown_name_returns_capability_not_found() {
+        let mut reg = ProviderRegistry::new();
+        reg.register(native_with_git_diff()).unwrap();
+        let err = reg
+            .resolve("nonexistent", &serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::CapabilityNotFound { ref name } if name == "nonexistent"),
+            "expected CapabilityNotFound, got: {err}"
+        );
     }
 }
