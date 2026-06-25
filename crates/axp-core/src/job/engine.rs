@@ -24,9 +24,9 @@
 //! critical section performs only infallible operations and is held briefly with
 //! no await inside, so a poisoned guard cannot expose a logically broken state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, RwLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::SystemTime;
@@ -35,12 +35,15 @@ use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
 
-use axp_proto::{JobId, JobPayload, JobStartRequest};
+use axp_proto::{JobId, JobPayload, JobStartRequest, SessionId};
 
 use crate::{
     Error, Result,
     capability::RuntimeCapability,
-    job::{DEFAULT_LOG_BYTE_CAP, Job, JobStatus, JobStore, LogBuffer, LogStream, resolve_cwd},
+    job::{
+        DEFAULT_LOG_BYTE_CAP, Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
+        resolve_cwd,
+    },
     session::SessionStore,
 };
 
@@ -232,7 +235,7 @@ impl JobEngine {
     async fn run_to_completion(
         &self,
         job_id: JobId,
-        handle: Arc<std::sync::RwLock<Job>>,
+        handle: Arc<RwLock<Job>>,
         mut child: tokio::process::Child,
         stdout: Option<tokio::process::ChildStdout>,
         stderr: Option<tokio::process::ChildStderr>,
@@ -320,11 +323,18 @@ impl JobEngine {
         };
 
         // Write the terminal state under a short lock with no await inside.
-        {
+        // The drainer's final state write does NOT push a log event, so it would
+        // not otherwise wake live subscribers. Capture the buffer's notify and
+        // fire it AFTER the terminal status is written so any `JobLogStream`
+        // waiting on a quiet-then-finished job observes the terminal state and
+        // returns `None` instead of hanging forever.
+        let notify = {
             let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
             job.status = final_status;
             job.finished_at = Some(SystemTime::now());
-        }
+            job.log_buffer.subscribe()
+        };
+        notify.notify_waiters();
 
         // Drop the cancellation sender; the job is finished.
         self.cancels().remove(&job_id);
@@ -338,12 +348,7 @@ impl JobEngine {
     /// # Errors
     ///
     /// Propagates [`Error::LogBufferOverflow`] from the underlying buffer.
-    fn push_log(
-        &self,
-        handle: &Arc<std::sync::RwLock<Job>>,
-        stream: LogStream,
-        bytes: &[u8],
-    ) -> Result<()> {
+    fn push_log(&self, handle: &Arc<RwLock<Job>>, stream: LogStream, bytes: &[u8]) -> Result<()> {
         let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
         job.log_buffer
             .push(stream, Bytes::copy_from_slice(bytes), SystemTime::now())?;
@@ -360,6 +365,144 @@ impl JobEngine {
                 Ok(())
             }
             None => Err(Error::JobNotFound(job_id.clone())),
+        }
+    }
+
+    /// Look up a job and verify it belongs to `session_id`.
+    ///
+    /// Returns [`Error::JobNotFound`] for both an unknown job AND a job owned by a
+    /// different session — we deliberately do not reveal a job's existence to the
+    /// wrong session.
+    fn lookup_owned(&self, session_id: &SessionId, job_id: &JobId) -> Result<Arc<RwLock<Job>>> {
+        let handle = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| Error::JobNotFound(job_id.clone()))?;
+        let owned = {
+            let j = handle.read().unwrap_or_else(|p| p.into_inner());
+            j.session_id == *session_id
+        };
+        if owned {
+            Ok(handle)
+        } else {
+            Err(Error::JobNotFound(job_id.clone()))
+        }
+    }
+
+    /// Return the current status and buffered-event count for a job the caller owns.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::JobNotFound`] if the job is unknown or owned by another session.
+    pub fn status(
+        &self,
+        req: &axp_proto::JobStatusRequest,
+    ) -> Result<axp_proto::JobStatusResponse> {
+        let handle = self.lookup_owned(&req.session_id, &req.job_id)?;
+        let j = handle.read().unwrap_or_else(|p| p.into_inner());
+        Ok(axp_proto::JobStatusResponse {
+            job_id: req.job_id.clone(),
+            status: j.status.clone().into(),
+            seq: j.log_buffer.len() as u64,
+        })
+    }
+
+    /// Attach to a job's log stream from `from_offset`.
+    ///
+    /// The returned [`JobLogStream`] replays buffered events at/after the offset,
+    /// then yields new events live until the job is terminal and fully drained.
+    /// This call is synchronous — it only builds the stream; the awaiting happens
+    /// in [`JobLogStream::next`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::JobNotFound`] if the job is unknown or owned by another session.
+    pub fn attach(&self, req: &axp_proto::JobAttachRequest) -> Result<JobLogStream> {
+        let handle = self.lookup_owned(&req.session_id, &req.job_id)?;
+        let notify = {
+            let j = handle.read().unwrap_or_else(|p| p.into_inner());
+            j.log_buffer.subscribe()
+        };
+        Ok(JobLogStream {
+            job_id: req.job_id.clone(),
+            handle,
+            notify,
+            cursor: req.from_offset,
+            pending: VecDeque::new(),
+        })
+    }
+}
+
+/// Convert a runtime [`LogStream`] to its wire form.
+fn stream_to_proto(s: LogStream) -> axp_proto::LogStreamProto {
+    match s {
+        LogStream::Stdout => axp_proto::LogStreamProto::Stdout,
+        LogStream::Stderr => axp_proto::LogStreamProto::Stderr,
+    }
+}
+
+/// Convert a buffered [`LogEvent`] into a wire [`axp_proto::LogEventFrame`].
+fn event_to_frame(job_id: &JobId, ev: &LogEvent) -> axp_proto::LogEventFrame {
+    let ts_millis = ev
+        .timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    axp_proto::LogEventFrame {
+        job_id: job_id.clone(),
+        seq: ev.seq,
+        stream: stream_to_proto(ev.stream),
+        data: ev.data.to_vec(),
+        ts_millis,
+    }
+}
+
+/// A reattachable, replay-then-live view over a single job's log stream.
+///
+/// Built by [`JobEngine::attach`]. It first replays all buffered events at or
+/// after the attach offset, then blocks on the buffer's wake signal to deliver
+/// new events as they are pushed, ending once the job is terminal and every
+/// buffered event has been delivered.
+pub struct JobLogStream {
+    job_id: JobId,
+    handle: Arc<RwLock<Job>>,
+    notify: Arc<tokio::sync::Notify>,
+    cursor: Seq,
+    pending: VecDeque<axp_proto::LogEventFrame>,
+}
+
+impl JobLogStream {
+    /// Yield the next log frame, or `None` once the job is terminal and all
+    /// buffered output has been delivered.
+    pub async fn next(&mut self) -> Option<axp_proto::LogEventFrame> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Some(frame);
+            }
+
+            // RACE-FREE WAIT: register interest BEFORE reading state, so a push
+            // that happens between our drain and our await is not missed.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let terminal = {
+                let job = self.handle.read().unwrap_or_else(|p| p.into_inner());
+                let new = job.log_buffer.since(self.cursor);
+                for ev in new {
+                    self.pending.push_back(event_to_frame(&self.job_id, ev));
+                    self.cursor = ev.seq + 1;
+                }
+                job.status.is_terminal()
+            }; // <-- lock dropped here, BEFORE any await
+
+            if !self.pending.is_empty() {
+                continue; // got new events; loop pops them
+            }
+            if terminal {
+                return None; // terminal AND nothing buffered → end
+            }
+            notified.await; // wait for the next push (or terminal-transition push)
         }
     }
 }
@@ -596,6 +739,186 @@ mod tests {
         assert!(
             matches!(status, JobStatus::Failed { ref reason } if reason.contains("overflow")),
             "expected Failed(log buffer overflow), got {status:?}"
+        );
+    }
+
+    // ── attach / status (U5c) ─────────────────────────────────────────────────
+
+    use axp_proto::{JobAttachRequest, JobStatusProto, JobStatusRequest, LogStreamProto};
+
+    fn attach_req(session_id: &SessionId, job_id: &JobId, from_offset: u64) -> JobAttachRequest {
+        JobAttachRequest {
+            session_id: session_id.clone(),
+            job_id: job_id.clone(),
+            from_offset,
+        }
+    }
+
+    fn status_req(session_id: &SessionId, job_id: &JobId) -> JobStatusRequest {
+        JobStatusRequest {
+            session_id: session_id.clone(),
+            job_id: job_id.clone(),
+        }
+    }
+
+    /// Concatenate the stdout bytes across a slice of collected frames.
+    fn stdout_of(frames: &[axp_proto::LogEventFrame]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for f in frames {
+            if f.stream == LogStreamProto::Stdout {
+                out.extend_from_slice(&f.data);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn attach_from_zero_replays_all_after_completion() {
+        let h = harness();
+        let req = command_req(&h.session_id, "echo alpha");
+        let id = h.engine.start(&req).await.expect("start");
+        poll_terminal(&h.engine, &id).await;
+
+        let mut stream = h
+            .engine
+            .attach(&attach_req(&h.session_id, &id, 0))
+            .expect("attach");
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame);
+        }
+
+        // Stream ended (the while loop above only exits on None).
+        assert!(!frames.is_empty(), "expected at least one frame");
+        // Seqs are contiguous from 0.
+        for (i, f) in frames.iter().enumerate() {
+            assert_eq!(f.seq, i as u64, "seqs must be contiguous from 0");
+        }
+        let out = stdout_of(&frames);
+        assert!(
+            out.windows(5).any(|w| w == b"alpha"),
+            "stdout must contain `alpha`, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_with_offset_skips_prior() {
+        let h = harness();
+        // The engine captures RAW chunks, not lines — so to produce several distinct
+        // log events we space the writes with brief sleeps, forcing separate reads.
+        let req = command_req(
+            &h.session_id,
+            "echo a; sleep 0.1; echo b; sleep 0.1; echo c",
+        );
+        let id = h.engine.start(&req).await.expect("start");
+        poll_terminal(&h.engine, &id).await;
+
+        // There must be at least 2 events to make offset 1 meaningful.
+        let st = h
+            .engine
+            .status(&status_req(&h.session_id, &id))
+            .expect("status");
+        assert!(st.seq >= 1, "expected buffered events, got seq={}", st.seq);
+
+        let mut stream = h
+            .engine
+            .attach(&attach_req(&h.session_id, &id, 1))
+            .expect("attach");
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame);
+        }
+        assert!(!frames.is_empty(), "expected frames from offset 1");
+        assert_eq!(frames[0].seq, 1, "first delivered frame must have seq == 1");
+        assert!(
+            frames.iter().all(|f| f.seq >= 1),
+            "no frame with seq 0 should be delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_live_receives_later_output() {
+        let h = harness();
+        let req = command_req(&h.session_id, "echo one; sleep 0.2; echo two");
+        let id = h.engine.start(&req).await.expect("start");
+
+        // Attach immediately (the job is still running) from offset 0.
+        let mut stream = h
+            .engine
+            .attach(&attach_req(&h.session_id, &id, 0))
+            .expect("attach");
+
+        // Guard the whole collection: a hang fails the test rather than wedging.
+        let frames = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut frames = Vec::new();
+            while let Some(frame) = stream.next().await {
+                frames.push(frame);
+            }
+            frames
+        })
+        .await
+        .expect("collecting live frames must not time out");
+
+        let out = stdout_of(&frames);
+        assert!(
+            out.windows(3).any(|w| w == b"one"),
+            "stdout must contain `one`, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+        assert!(
+            out.windows(3).any(|w| w == b"two"),
+            "stdout must contain `two`, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn status_after_exit_reports_exited() {
+        let h = harness();
+        let req = command_req(&h.session_id, "echo hi");
+        let id = h.engine.start(&req).await.expect("start");
+        poll_terminal(&h.engine, &id).await;
+
+        let st = h
+            .engine
+            .status(&status_req(&h.session_id, &id))
+            .expect("status");
+        assert_eq!(st.status, JobStatusProto::Exited { code: 0 });
+        assert!(st.seq >= 1, "expected at least one buffered event");
+    }
+
+    #[tokio::test]
+    async fn attach_wrong_session_returns_not_found() {
+        let h = harness();
+        let req = command_req(&h.session_id, "echo hi");
+        let id = h.engine.start(&req).await.expect("start");
+        poll_terminal(&h.engine, &id).await;
+
+        let other = SessionId("s_other".into());
+        let attach = h.engine.attach(&attach_req(&other, &id, 0));
+        assert!(
+            matches!(attach.as_ref().err(), Some(Error::JobNotFound(_))),
+            "expected JobNotFound for wrong-session attach, got {:?}",
+            attach.map(|_| "ok")
+        );
+        let status = h.engine.status(&status_req(&other, &id));
+        assert!(
+            matches!(status.as_ref().err(), Some(Error::JobNotFound(_))),
+            "expected JobNotFound for wrong-session status, got {:?}",
+            status.map(|_| "ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn status_unknown_job_returns_not_found() {
+        let h = harness();
+        let unknown = JobId("j_unknown".into());
+        let status = h.engine.status(&status_req(&h.session_id, &unknown));
+        assert!(
+            matches!(status.as_ref().err(), Some(Error::JobNotFound(_))),
+            "expected JobNotFound for unknown job, got {:?}",
+            status.map(|_| "ok")
         );
     }
 }

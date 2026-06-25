@@ -1,5 +1,6 @@
 //! Append-only, replayable log buffer for a job's stdout/stderr output.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
@@ -47,6 +48,9 @@ pub struct LogBuffer {
     events: Vec<LogEvent>,
     byte_total: usize,
     byte_cap: usize,
+    /// Wake signal fired after each successful push so live subscribers re-read
+    /// via [`since`](LogBuffer::since). Shared with every [`subscribe`](LogBuffer::subscribe) handle.
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl LogBuffer {
@@ -61,6 +65,7 @@ impl LogBuffer {
             events: Vec::new(),
             byte_total: 0,
             byte_cap,
+            notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -81,7 +86,18 @@ impl LogBuffer {
             data,
             timestamp,
         });
+        self.notify.notify_waiters();
         Ok(seq)
+    }
+
+    /// Return a handle to this buffer's wake signal.
+    ///
+    /// The signal is fired after each successful [`push`](LogBuffer::push);
+    /// subscribers await it and then re-read new events via
+    /// [`since`](LogBuffer::since). All handles share the same underlying
+    /// [`tokio::sync::Notify`].
+    pub fn subscribe(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.notify)
     }
 
     /// Return all events with `seq >= from_seq`.
@@ -173,5 +189,15 @@ mod tests {
         );
         // The failed push must NOT have been appended.
         assert_eq!(buf.len(), 1, "event must not be appended on overflow");
+    }
+
+    #[test]
+    fn subscribe_returns_a_usable_handle() {
+        let mut buf = LogBuffer::new();
+        push_chunk(&mut buf, b"x").unwrap();
+        let handle = buf.subscribe();
+        // The handle is a usable Notify; a second handle points at the same one.
+        let handle2 = buf.subscribe();
+        assert!(Arc::ptr_eq(&handle, &handle2));
     }
 }

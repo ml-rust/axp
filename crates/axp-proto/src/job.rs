@@ -63,6 +63,63 @@ pub enum JobStatusProto {
     Failed { reason: String },
 }
 
+/// Which standard stream a log frame came from (wire form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogStreamProto {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+/// A single log frame streamed to an attached client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEventFrame {
+    /// The job this frame belongs to.
+    pub job_id: JobId,
+    /// Monotonic sequence number of this frame within the job's log stream.
+    pub seq: u64,
+    /// Which standard stream the bytes came from.
+    pub stream: LogStreamProto,
+    /// Raw log bytes for this chunk.
+    pub data: Vec<u8>,
+    /// Milliseconds since the Unix epoch when the chunk was captured.
+    pub ts_millis: u64,
+}
+
+/// `job.attach` request: reattach to a job's log stream from a given offset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobAttachRequest {
+    /// The session the caller is operating within (must own the job).
+    pub session_id: SessionId,
+    /// The job to attach to.
+    pub job_id: JobId,
+    /// Resume from this sequence number (0 = from the beginning). `Last-Event-ID` semantics.
+    #[serde(default)]
+    pub from_offset: u64,
+}
+
+/// `job.status` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStatusRequest {
+    /// The session the caller is operating within (must own the job).
+    pub session_id: SessionId,
+    /// The job to report on.
+    pub job_id: JobId,
+}
+
+/// `job.status` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStatusResponse {
+    /// The job this status describes.
+    pub job_id: JobId,
+    /// Current lifecycle status of the job.
+    pub status: JobStatusProto,
+    /// Current number of buffered log events (useful for offset negotiation).
+    pub seq: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +244,51 @@ mod tests {
         let val = serde_json::to_value(&orig).unwrap();
         let back: JobStatusProto = serde_json::from_value(val).unwrap();
         assert_eq!(orig, back);
+    }
+
+    #[test]
+    fn log_event_frame_round_trips_with_snake_case_stream() {
+        let frame = LogEventFrame {
+            job_id: JobId("j_7".into()),
+            seq: 3,
+            stream: LogStreamProto::Stdout,
+            data: b"hello".to_vec(),
+            ts_millis: 1_700_000_000_000,
+        };
+        let value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(value["stream"], "stdout");
+        let frame2: LogEventFrame = serde_json::from_value(value).unwrap();
+        assert_eq!(frame, frame2);
+    }
+
+    #[test]
+    fn job_attach_request_from_offset_defaults_to_zero() {
+        let json = serde_json::json!({
+            "session_id": "s_1",
+            "job_id": "j_1"
+        });
+        let req: JobAttachRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.from_offset, 0);
+        // And a full round trip preserves an explicit offset.
+        let req2 = JobAttachRequest {
+            session_id: SessionId("s_1".into()),
+            job_id: JobId("j_1".into()),
+            from_offset: 42,
+        };
+        let back: JobAttachRequest =
+            serde_json::from_value(serde_json::to_value(&req2).unwrap()).unwrap();
+        assert_eq!(req2, back);
+    }
+
+    #[test]
+    fn job_status_response_round_trips() {
+        let resp = JobStatusResponse {
+            job_id: JobId("j_9".into()),
+            status: JobStatusProto::Exited { code: 0 },
+            seq: 5,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let resp2: JobStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, resp2);
     }
 }

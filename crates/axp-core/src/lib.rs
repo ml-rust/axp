@@ -27,8 +27,8 @@ mod workspace;
 pub use capability::{CapabilitySet, RuntimeCapability};
 pub use error::{Error, Result};
 pub use job::{
-    DEFAULT_LOG_BYTE_CAP, Job, JobEngine, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
-    resolve_cwd,
+    DEFAULT_LOG_BYTE_CAP, Job, JobEngine, JobLogStream, JobStatus, JobStore, LogBuffer, LogEvent,
+    LogStream, Seq, resolve_cwd,
 };
 pub use provider::{CapabilityDescriptor, CapabilityListing, NativeProvider, Provider};
 pub use registry::ProviderRegistry;
