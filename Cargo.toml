@@ -20,6 +20,8 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 bytes = "1"
 landlock = "0.4"
+seccompiler = "0.5"
+libc = "0.2"
 
 # Internal
 axp-proto = { path = "crates/axp-proto", version = "0.0.0" }

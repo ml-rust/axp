@@ -13,10 +13,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true } # for the tokio::process::Command type in apply()'s signature
 
 # Linux-only: the actual kernel-sandbox crates. cfg-gated so macOS/Windows still build.
-# Per declare-on-use, U6a only uses `landlock` (the availability probe); `seccompiler`
-# and `nix` are added by U6b/U6c when their code references them.
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { workspace = true }
+seccompiler = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

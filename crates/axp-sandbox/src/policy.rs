@@ -56,10 +56,12 @@ impl SandboxPolicy {
     /// Apply this policy to a child command before it is spawned.
     ///
     /// - `DevNone` → no-op, `Ok(())`.
-    /// - `KernelLsm` → on Linux, installs real Landlock filesystem enforcement on
-    ///   `cmd` via a `pre_exec` hook (see `crate::linux::enforce`). If Landlock is
-    ///   unavailable it returns `Err(Unavailable)` — it does NOT silently no-op,
-    ///   which would be false security. On non-Linux it returns `Err(Unavailable)`.
+    /// - `KernelLsm` → on Linux, installs real Landlock filesystem enforcement
+    ///   (see `crate::linux::enforce`) followed by a seccomp-bpf syscall filter
+    ///   (see `crate::seccomp::apply`) on `cmd`, each via a `pre_exec` hook. If
+    ///   Landlock is unavailable it returns `Err(Unavailable)` — it does NOT
+    ///   silently no-op, which would be false security. On non-Linux it returns
+    ///   `Err(Unavailable)`.
     /// - `Container` / `ProcessToken` → `Err(Unavailable)` (not supported on this backend).
     pub fn apply(&self, cmd: &mut tokio::process::Command) -> Result<(), SandboxError> {
         match self.tier {
@@ -67,7 +69,11 @@ impl SandboxPolicy {
             EnforcementTier::KernelLsm => {
                 #[cfg(target_os = "linux")]
                 {
-                    crate::linux::enforce(self, cmd)
+                    // Landlock hook first, seccomp hook second. Both are
+                    // permissive toward the other's syscalls, so order is safe.
+                    crate::linux::enforce(self, cmd)?;
+                    crate::seccomp::apply(cmd)?;
+                    Ok(())
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
