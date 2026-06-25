@@ -45,13 +45,17 @@ fn require_session(state: &AppState, id: &SessionId) -> Result<(), TransportErro
 /// Handle `session.open`: open an isolated workspace session.
 ///
 /// Parses the workspace path and capability grants from the request, mints a
-/// new session id, opens the session in the store, and returns a
-/// [`SessionOpenResponse`] with the assigned id and granted tier.
+/// new session id and a fresh sparse-capability [`CapToken`](axp_core::CapToken),
+/// stores the token on the session, and returns a [`SessionOpenResponse`]
+/// carrying the raw token, the assigned id, and the granted tier.
 ///
-/// # TODO
+/// The `cap_token` is the unforgeable credential the client must present on
+/// subsequent calls; the `session_id` remains a non-secret addressing handle.
 ///
-/// Replace `cap_token` with a real object-capability token and add
-/// cryptographic validation of tokens on subsequent calls.
+/// # Note
+///
+/// This handler mints, stores, and returns the token, but does **not** yet
+/// enforce it on subsequent RPC calls — that enforcement is a follow-up unit.
 pub(crate) async fn session_open(
     state: &AppState,
     params: serde_json::Value,
@@ -60,13 +64,17 @@ pub(crate) async fn session_open(
     let workspace = Workspace::new(&req.workspace)?;
     let caps = CapabilitySet::from_wire(&req.capabilities)?;
     let id = state.next_session_id();
-    // TODO(auth): real object-capability token + validation (post-MVP)
+    // Mint a high-entropy sparse capability; `?` maps axp_core::Error::Entropy
+    // into TransportError via the `Runtime` `#[from]` conversion.
+    let cap_token = axp_core::CapToken::generate()?;
     let resp = SessionOpenResponse {
-        cap_token: id.0.clone(),
+        cap_token: cap_token.expose().to_owned(),
         session_id: id.clone(),
         granted_tier: req.sandbox_tier,
     };
-    state.sessions.open(id, workspace, req.sandbox_tier, caps);
+    state
+        .sessions
+        .open(id, workspace, req.sandbox_tier, caps, cap_token);
     to_value(&resp)
 }
 

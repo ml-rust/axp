@@ -152,7 +152,7 @@ pub(crate) async fn attach_sse(
 mod tests {
     use std::time::Duration;
 
-    use axp_core::{CapabilitySet, RuntimeCapability, Workspace};
+    use axp_core::{CapToken, CapabilitySet, RuntimeCapability, Workspace};
     use axp_proto::{EnforcementTier, JobId, JobPayload, JobStartRequest, SessionId};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -190,6 +190,7 @@ mod tests {
             ws,
             EnforcementTier::DevNone,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+            CapToken::generate().expect("entropy"),
         );
         let req = JobStartRequest {
             session_id: sid.clone(),

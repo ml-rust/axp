@@ -113,6 +113,14 @@ pub enum Error {
         #[source]
         source: axp_sandbox::SandboxError,
     },
+
+    /// The OS entropy source could not be read while minting a capability token.
+    ///
+    /// The underlying error is deliberately not captured: it carries no useful
+    /// detail for the caller and the failure is reported generically to avoid
+    /// leaking host state.
+    #[error("failed to gather entropy for capability token")]
+    Entropy,
 }
 
 /// A `Result` alias that defaults the error type to [`Error`].

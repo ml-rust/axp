@@ -729,6 +729,10 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    fn fresh_token() -> crate::CapToken {
+        crate::CapToken::generate().expect("entropy")
+    }
+
     /// Build a harness: a session over a fresh tempdir workspace with the given
     /// capabilities, plus a job store and engine.
     fn harness_with(caps: CapabilitySet) -> Harness {
@@ -736,7 +740,13 @@ mod tests {
         let ws = Workspace::new(dir.path()).expect("workspace");
         let sessions = SessionStore::new();
         let session_id = SessionId("s_test".into());
-        sessions.open(session_id.clone(), ws, EnforcementTier::DevNone, caps);
+        sessions.open(
+            session_id.clone(),
+            ws,
+            EnforcementTier::DevNone,
+            caps,
+            fresh_token(),
+        );
         let jobs = JobStore::new();
         let engine = JobEngine::new(
             sessions,
@@ -893,7 +903,13 @@ mod tests {
         let ws = Workspace::new(dir.path()).expect("workspace");
         let sessions = SessionStore::new();
         let session_id = SessionId("s_cap".into());
-        sessions.open(session_id.clone(), ws, EnforcementTier::DevNone, caps);
+        sessions.open(
+            session_id.clone(),
+            ws,
+            EnforcementTier::DevNone,
+            caps,
+            fresh_token(),
+        );
 
         let provider = NativeProvider::new(
             "test",
@@ -1313,6 +1329,7 @@ mod tests {
             ws,
             EnforcementTier::DevNone,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+            fresh_token(),
         );
         let jobs = JobStore::new();
         let engine = JobEngine::new(
@@ -1373,6 +1390,7 @@ mod tests {
             ws,
             EnforcementTier::KernelLsm,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+            fresh_token(),
         );
         let engine = JobEngine::new(
             sessions,
@@ -1428,6 +1446,7 @@ mod tests {
             ws,
             EnforcementTier::KernelLsm,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
+            fresh_token(),
         );
         let engine = JobEngine::new(
             sessions,

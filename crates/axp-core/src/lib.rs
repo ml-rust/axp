@@ -4,6 +4,7 @@
 //! It depends on `axp-proto` for protocol types and provides:
 //!
 //! - [`Workspace`] — canonical, absolute workspace root.
+//! - [`CapToken`] — unforgeable sparse-capability session credential.
 //! - [`RuntimeCapability`] / [`CapabilitySet`] — structured, attenuable capability grants.
 //! - [`Session`] / [`SessionStore`] — runtime session lifecycle and in-memory store.
 //! - [`Provider`] / [`NativeProvider`] — runtime capability provider trait and in-memory impl.
@@ -17,6 +18,7 @@
 //! only narrow (never broaden) authority, and verbs are strictly orthogonal.
 //! See [`capability`] for the full contract.
 
+mod auth;
 mod builtins;
 mod capability;
 mod error;
@@ -26,6 +28,7 @@ mod registry;
 mod session;
 mod workspace;
 
+pub use auth::CapToken;
 pub use builtins::builtin_registry;
 pub use capability::{CapabilitySet, RuntimeCapability};
 pub use error::{Error, Result};

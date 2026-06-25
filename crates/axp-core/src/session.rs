@@ -25,7 +25,7 @@ use std::time::SystemTime;
 
 use axp_proto::{EnforcementTier, JobId, JobStatusProto, SessionId};
 
-use crate::{Error, Result, capability::CapabilitySet, workspace::Workspace};
+use crate::{Error, Result, auth::CapToken, capability::CapabilitySet, workspace::Workspace};
 
 // ── AuditEvent ────────────────────────────────────────────────────────────────
 
@@ -77,6 +77,9 @@ pub struct Session {
     pub tier: EnforcementTier,
     /// The set of capability grants held by this session.
     pub capabilities: CapabilitySet,
+    /// The unforgeable credential proving authority over this session;
+    /// possession is authority.
+    pub(crate) cap_token: CapToken,
     /// The wall-clock time at which this session was created.
     pub created_at: SystemTime,
     /// Ordered audit log (append-only during the session lifetime).
@@ -91,12 +94,14 @@ impl Session {
         workspace: Workspace,
         tier: EnforcementTier,
         capabilities: CapabilitySet,
+        cap_token: CapToken,
     ) -> Self {
         Self {
             id,
             workspace,
             tier,
             capabilities,
+            cap_token,
             created_at: SystemTime::now(),
             audit_events: Vec::new(),
         }
@@ -153,8 +158,10 @@ impl SessionStore {
     /// Open a new session and insert it into the store.
     ///
     /// A [`SessionOpened`](AuditEventKind::SessionOpened) event is recorded on
-    /// the session before it is returned.  The caller supplies the `id` — the
-    /// store does not generate identifiers.
+    /// the session before it is returned.  The caller supplies both the `id`
+    /// and the [`CapToken`] — the store mints neither, mirroring how identity
+    /// and credential are established at the edge.  This keeps `open`
+    /// infallible (token minting / entropy is the caller's concern).
     ///
     /// Returns an `Arc<RwLock<Session>>` handle that the caller can hold
     /// alongside (or instead of) using [`get`](Self::get) later.
@@ -164,13 +171,33 @@ impl SessionStore {
         workspace: Workspace,
         tier: EnforcementTier,
         capabilities: CapabilitySet,
+        cap_token: CapToken,
     ) -> Arc<RwLock<Session>> {
-        let mut session = Session::new(id.clone(), workspace, tier, capabilities);
+        let mut session = Session::new(id.clone(), workspace, tier, capabilities, cap_token);
         session.record_audit(AuditEventKind::SessionOpened);
 
         let handle = Arc::new(RwLock::new(session));
         self.write_map().insert(id, Arc::clone(&handle));
         handle
+    }
+
+    /// Validate a `presented` capability token against the session identified by
+    /// `id`.
+    ///
+    /// Returns `true` only if the session exists *and* its stored
+    /// [`CapToken`] matches `presented` in constant time
+    /// ([`CapToken::verify`]).  Returns `false` for an unknown session id.  This
+    /// is the validation primitive that request handlers use to authorize
+    /// calls against a session.
+    pub fn authorize(&self, id: &SessionId, presented: &str) -> bool {
+        match self.get(id) {
+            Some(handle) => handle
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .cap_token
+                .verify(presented),
+            None => false,
+        }
     }
 
     /// Look up a live session by id, returning a shared handle or `None`.
@@ -223,6 +250,10 @@ mod tests {
         SessionId(s.to_owned())
     }
 
+    fn token() -> CapToken {
+        CapToken::generate().expect("entropy")
+    }
+
     #[test]
     fn open_and_get_returns_matching_session() {
         let store = make_store();
@@ -233,6 +264,7 @@ mod tests {
             ws,
             EnforcementTier::DevNone,
             CapabilitySet::default(),
+            token(),
         );
 
         let handle = store.get(&id).expect("session should be present");
@@ -255,6 +287,7 @@ mod tests {
             make_workspace(),
             EnforcementTier::DevNone,
             CapabilitySet::default(),
+            token(),
         );
 
         store.close(&id).expect("close should succeed");
@@ -285,6 +318,7 @@ mod tests {
             make_workspace(),
             EnforcementTier::DevNone,
             CapabilitySet::default(),
+            token(),
         );
 
         let session = handle.read().unwrap();
@@ -305,6 +339,7 @@ mod tests {
             make_workspace(),
             EnforcementTier::DevNone,
             CapabilitySet::default(),
+            token(),
         );
 
         store.close(&id).unwrap();
@@ -327,6 +362,7 @@ mod tests {
             make_workspace(),
             EnforcementTier::DevNone,
             CapabilitySet::default(),
+            token(),
         );
 
         assert!(
@@ -344,10 +380,47 @@ mod tests {
             make_workspace(),
             EnforcementTier::DevNone,
             CapabilitySet::default(),
+            token(),
         );
         let after = SystemTime::now();
         let session = handle.read().unwrap();
         assert!(session.created_at >= before);
         assert!(session.created_at <= after);
+    }
+
+    #[test]
+    fn authorize_accepts_correct_token() {
+        let store = make_store();
+        let id = sid("s_auth_ok");
+        let handle = store.open(
+            id.clone(),
+            make_workspace(),
+            EnforcementTier::DevNone,
+            CapabilitySet::default(),
+            token(),
+        );
+        // Recover the raw token via `expose` (Debug is redacted).
+        let raw = handle.read().unwrap().cap_token.expose().to_owned();
+        assert!(store.authorize(&id, &raw));
+    }
+
+    #[test]
+    fn authorize_rejects_wrong_token() {
+        let store = make_store();
+        let id = sid("s_auth_wrong");
+        store.open(
+            id.clone(),
+            make_workspace(),
+            EnforcementTier::DevNone,
+            CapabilitySet::default(),
+            token(),
+        );
+        assert!(!store.authorize(&id, "ct_not_the_real_token"));
+    }
+
+    #[test]
+    fn authorize_rejects_unknown_session() {
+        let store = make_store();
+        assert!(!store.authorize(&sid("s_ghost"), "ct_anything"));
     }
 }
