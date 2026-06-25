@@ -1,23 +1,30 @@
 //! Axum router and JSON-RPC dispatcher.
 //!
-//! Exposes a single `POST /` endpoint that speaks JSON-RPC 2.0.  The
-//! `dispatch` function routes each method to its handler in [`crate::handlers`].
+//! Exposes a `POST /` endpoint that speaks JSON-RPC 2.0 and a separate
+//! `GET /job/attach` endpoint that streams a job's log frames as SSE.  The
+//! `dispatch` function routes each JSON-RPC method to its handler in
+//! [`crate::handlers`].
 
 use axum::{Json, extract::State, response::IntoResponse, routing};
 
 use crate::{
     handlers,
-    jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR},
+    jsonrpc::{
+        INVALID_REQUEST, JsonRpcError, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND,
+        PARSE_ERROR,
+    },
     state::AppState,
 };
 
-/// Build the axum [`Router`] for the AXP JSON-RPC endpoint.
+/// Build the axum [`Router`] for the AXP endpoints.
 ///
-/// A single `POST /` route is registered.  The `state` is cloned into the
-/// router; all handlers share it cheaply via `Arc`-backed fields.
+/// Registers `POST /` for JSON-RPC 2.0 and `GET /job/attach` for the resumable
+/// SSE log stream.  The `state` is cloned into the router; all handlers share it
+/// cheaply via `Arc`-backed fields.
 pub fn build_router(state: AppState) -> axum::Router {
     axum::Router::new()
         .route("/", routing::post(rpc_handler))
+        .route("/job/attach", routing::get(crate::attach::attach_sse))
         .with_state(state)
 }
 
@@ -52,8 +59,9 @@ async fn rpc_handler(State(state): State<AppState>, body: axum::body::Bytes) -> 
 /// result of the handler (`Ok(Value)` or `Err(TransportError)`) is converted
 /// into a [`JsonRpcResponse`] with the echoed request id.
 ///
-/// `job.attach` is stubbed as `METHOD_NOT_FOUND` — streaming attach is served
-/// over a dedicated SSE endpoint that is not yet implemented.
+/// `job.attach` is not dispatched here — it is a streaming endpoint served over
+/// `GET /job/attach` (SSE).  The JSON-RPC arm returns `INVALID_REQUEST` directing
+/// clients to that endpoint.
 ///
 /// The response id always echoes the request id (`null` when absent).
 pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse {
@@ -70,8 +78,8 @@ pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse 
             return JsonRpcResponse::error(
                 id,
                 JsonRpcError {
-                    code: METHOD_NOT_FOUND,
-                    message: "job.attach streaming is not yet available".into(),
+                    code: INVALID_REQUEST,
+                    message: "job.attach is a streaming endpoint; connect with GET /job/attach (text/event-stream)".into(),
                     data: None,
                 },
             );
@@ -104,7 +112,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::jsonrpc::METHOD_NOT_FOUND;
+    use crate::jsonrpc::{INVALID_REQUEST, METHOD_NOT_FOUND};
 
     fn make_state() -> AppState {
         let sessions = SessionStore::new();
@@ -164,7 +172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_attach_returns_method_not_found() {
+    async fn job_attach_directs_to_streaming_endpoint() {
         let state = make_state();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
@@ -175,12 +183,17 @@ mod tests {
         let resp = dispatch(&state, req).await;
         let s = serde_json::to_string(&resp).unwrap();
         assert!(
-            s.contains(&METHOD_NOT_FOUND.to_string()),
-            "expected METHOD_NOT_FOUND for job.attach: {s}"
+            s.contains(&INVALID_REQUEST.to_string()),
+            "expected INVALID_REQUEST for job.attach: {s}"
         );
         assert!(
-            s.contains("not yet available"),
-            "expected neutral unavailability message in job.attach response: {s}"
+            s.contains("GET /job/attach"),
+            "expected message directing to the streaming endpoint: {s}"
+        );
+        // The dispatcher must not treat job.attach as an unknown method.
+        assert!(
+            !s.contains(&METHOD_NOT_FOUND.to_string()),
+            "job.attach must not be METHOD_NOT_FOUND: {s}"
         );
     }
 }

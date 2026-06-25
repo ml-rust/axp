@@ -154,7 +154,10 @@ mod tests {
 
     use crate::{
         AppState,
-        jsonrpc::{INVALID_PARAMS, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, NOT_FOUND},
+        jsonrpc::{
+            INVALID_PARAMS, INVALID_REQUEST, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND,
+            NOT_FOUND,
+        },
         router::dispatch,
     };
 
@@ -331,12 +334,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_attach_returns_method_not_found() {
+    async fn job_attach_directs_to_streaming_endpoint() {
         let state = make_state();
         let v = call(&state, "job.attach", json!(null)).await;
         assert_eq!(
-            v["error"]["code"], METHOD_NOT_FOUND,
-            "expected METHOD_NOT_FOUND for job.attach (streaming not yet implemented): {v}"
+            v["error"]["code"], INVALID_REQUEST,
+            "expected INVALID_REQUEST for job.attach (served over GET /job/attach): {v}"
         );
     }
 }

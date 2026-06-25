@@ -23,6 +23,8 @@ landlock = "0.4"
 seccompiler = "0.5"
 libc = "0.2"
 axum = "0.8"
+async-stream = "0.3"
+tower = "0.5"
 
 # Internal
 axp-proto = { path = "crates/axp-proto", version = "0.0.0" }

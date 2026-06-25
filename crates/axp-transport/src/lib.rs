@@ -1,9 +1,11 @@
 //! `axp-transport` — JSON-RPC-2.0-over-HTTP transport for AXP.
 //!
 //! This crate provides the wire-protocol layer: envelope types, error mapping,
-//! shared application state, the axum router, and the six core JSON-RPC method
-//! handlers.  A server run-loop and streaming attach are not yet wired.
+//! shared application state, the axum router, the six core JSON-RPC method
+//! handlers, and a resumable SSE endpoint for streaming `job.attach`.  A server
+//! run-loop is not yet wired.
 
+mod attach;
 mod error;
 mod handlers;
 mod jsonrpc;
