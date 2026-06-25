@@ -44,11 +44,14 @@ impl AppState {
     /// This is the standard wiring used by the server and the tests.
     pub fn new() -> Self {
         let sessions = SessionStore::new();
-        let engine = JobEngine::new(sessions.clone(), JobStore::new());
+        // One registry, shared by the engine (for resolving capability payloads)
+        // and the `registry` field (for the discovery handlers).
+        let registry = Arc::new(RwLock::new(builtin_registry()));
+        let engine = JobEngine::new(sessions.clone(), JobStore::new(), Arc::clone(&registry));
         Self {
             sessions,
             engine,
-            registry: Arc::new(RwLock::new(builtin_registry())),
+            registry,
             session_counter: Arc::new(AtomicU64::new(1)),
         }
     }

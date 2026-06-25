@@ -48,6 +48,8 @@ use crate::{
         DEFAULT_LOG_BYTE_CAP, Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
         resolve_cwd,
     },
+    provider::ResolvedCommand,
+    registry::ProviderRegistry,
     session::{AuditEventKind, SessionStore},
     workspace::Workspace,
 };
@@ -61,6 +63,19 @@ struct JobTask {
     job_id: JobId,
     session_id: SessionId,
     handle: Arc<RwLock<Job>>,
+}
+
+/// What a job actually runs: either a user shell string or a resolved capability argv.
+///
+/// Both variants flow through one uniform command-build path in [`JobEngine::start`];
+/// the distinction is only *how* the program/args are derived. The `Argv` path is
+/// shell-injection-safe: the program and arguments are passed directly to
+/// `Command::new(program).args(args)`, never interpolated into a `sh -c` string.
+enum Runnable<'a> {
+    /// A user shell string, run via `sh -c` (from a [`JobPayload::Command`]).
+    Shell(&'a str),
+    /// A resolved capability, run as argv via `Command::new(program).args(args)`.
+    Argv(ResolvedCommand),
 }
 
 /// Runs jobs as child processes, capturing their output into each job's log buffer.
@@ -77,21 +92,31 @@ pub struct JobEngine {
     /// Per-job log-buffer byte cap. A job whose output exceeds this is killed and
     /// marked `Failed` (output is never silently dropped).
     log_byte_cap: usize,
+    /// Capability provider registry, shared (typically with `AppState.registry`).
+    /// Read under a short-lived guard to resolve a [`JobPayload::Capability`] to an
+    /// argv command; the guard is never held across an `.await`.
+    registry: Arc<RwLock<ProviderRegistry>>,
 }
 
 impl JobEngine {
-    /// Create a new engine over the given session and job stores.
+    /// Create a new engine over the given session and job stores, sharing the
+    /// given capability provider `registry` (used to resolve capability payloads).
     ///
     /// Job ids begin at `j_1`; the cancellation table starts empty; the per-job
     /// log-buffer cap defaults to [`DEFAULT_LOG_BYTE_CAP`]. Use
     /// [`with_log_byte_cap`](Self::with_log_byte_cap) to override it.
-    pub fn new(sessions: SessionStore, jobs: JobStore) -> Self {
+    pub fn new(
+        sessions: SessionStore,
+        jobs: JobStore,
+        registry: Arc<RwLock<ProviderRegistry>>,
+    ) -> Self {
         Self {
             sessions,
             jobs,
             next_id: Arc::new(AtomicU64::new(1)),
             cancels: Arc::new(Mutex::new(HashMap::new())),
             log_byte_cap: DEFAULT_LOG_BYTE_CAP,
+            registry,
         }
     }
 
@@ -151,10 +176,14 @@ impl JobEngine {
     ///
     /// - [`Error::SessionNotFound`] if the session id is unknown.
     /// - [`Error::CapabilityDenied`] if the session lacks `proc.spawn` for a
-    ///   command payload, or lacks any requested job-level capability.
+    ///   command payload, lacks `tool:<name>` (or `proc.spawn`) for a capability
+    ///   payload, or lacks any requested job-level capability.
     /// - [`Error::NotImplemented`] for code-mode payloads (not yet supported).
+    /// - [`Error::CapabilityNotFound`] if a capability payload names an unknown
+    ///   capability.
     /// - [`Error::WorkspaceViolation`] if `cwd` resolves outside the workspace.
-    /// - [`Error::CapabilityParse`] if a requested capability is malformed.
+    /// - [`Error::CapabilityParse`] if a requested capability is malformed, or a
+    ///   capability payload's params fail to bind.
     /// - [`Error::JobSpawn`] if the child process fails to spawn.
     pub async fn start(&self, req: &JobStartRequest) -> Result<JobId> {
         // 1. Resolve the session and clone out the bits we need under a short read
@@ -168,22 +197,39 @@ impl JobEngine {
             (s.workspace.clone(), s.capabilities.clone(), s.tier)
         };
 
-        // 2. Determine the command string from the payload, enforcing the
-        //    payload-level capability requirement.
-        let command = match &req.payload {
+        // 2. Determine what to run from the payload, enforcing the payload-level
+        //    capability requirement and (for capabilities) resolving via the registry.
+        let runnable = match &req.payload {
             JobPayload::Command { command } => {
                 if !capabilities.permits(&RuntimeCapability::ProcSpawn) {
                     return Err(Error::CapabilityDenied {
                         required: "proc.spawn".into(),
                     });
                 }
-                command
+                Runnable::Shell(command)
             }
             JobPayload::Code { .. } => {
                 return Err(Error::NotImplemented("code-mode execution"));
             }
-            JobPayload::Capability { .. } => {
-                return Err(Error::NotImplemented("capability invocation"));
+            JobPayload::Capability { name, params } => {
+                // A capability invocation requires the narrow `tool:<name>` grant OR
+                // the broad proc.spawn (which subsumes it).
+                let tool_grant = RuntimeCapability::Tool(name.clone());
+                if !capabilities.permits(&tool_grant)
+                    && !capabilities.permits(&RuntimeCapability::ProcSpawn)
+                {
+                    return Err(Error::CapabilityDenied {
+                        required: format!("tool:{name}"),
+                    });
+                }
+                // Resolve to an argv command. The registry read guard is dropped at
+                // the end of this block (NEVER held across the later `.await`);
+                // `resolved` is owned.
+                let resolved = {
+                    let reg = self.registry.read().unwrap_or_else(|p| p.into_inner());
+                    reg.resolve(name, params)?
+                };
+                Runnable::Argv(resolved)
             }
         };
 
@@ -201,18 +247,35 @@ impl JobEngine {
             }
         }
 
-        // 5. Build the command.
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(&cwd)
+        // 5. Build the command. Shell payloads run via `sh -c`; capability payloads
+        //    run as a resolved argv (no shell), which is shell-injection-safe.
+        let mut cmd = match &runnable {
+            Runnable::Shell(s) => {
+                let mut c = tokio::process::Command::new("sh");
+                c.arg("-c").arg(s);
+                c
+            }
+            Runnable::Argv(r) => {
+                let mut c = tokio::process::Command::new(&r.program);
+                c.args(&r.args);
+                c
+            }
+        };
+        cmd.current_dir(&cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
         // 6. Build and apply the sandbox policy for this job's tier + capabilities.
-        let policy = build_sandbox_policy(tier, &workspace, &capabilities);
+        let mut policy = build_sandbox_policy(tier, &workspace, &capabilities);
+        if matches!(runnable, Runnable::Argv(_)) {
+            // Running a named tool inherently spawns its one resolved program; the
+            // `tool:<name>` grant authorizes that single spawn even without the broad
+            // proc.spawn grant. (Currently advisory — proc-spawn seccomp gating is a
+            // later unit — but set correctly so enforcement stays correct when added.)
+            policy.allow_proc_spawn = true;
+        }
         policy.apply(&mut cmd).map_err(|e| match e {
             SandboxError::Unavailable { .. } => Error::SandboxUnavailable { source: e },
             _ => Error::SandboxApply { source: e },
@@ -675,7 +738,11 @@ mod tests {
         let session_id = SessionId("s_test".into());
         sessions.open(session_id.clone(), ws, EnforcementTier::DevNone, caps);
         let jobs = JobStore::new();
-        let engine = JobEngine::new(sessions, jobs);
+        let engine = JobEngine::new(
+            sessions,
+            jobs,
+            std::sync::Arc::new(std::sync::RwLock::new(crate::ProviderRegistry::new())),
+        );
         Harness {
             engine,
             session_id,
@@ -814,22 +881,104 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn capability_payload_not_implemented() {
-        let h = harness();
-        let req = JobStartRequest {
-            session_id: h.session_id.clone(),
+    // ── capability invocation ────────────────────────────────────────────────
+
+    /// Build a harness whose registry contains a single host-independent
+    /// capability `say_hi` (program `echo`, fixed literal arg `hi`), and whose
+    /// session is opened with `caps` over a fresh tempdir at the `DevNone` tier.
+    fn capability_harness(caps: CapabilitySet) -> Harness {
+        use crate::{CapabilityArg, CapabilityDescriptor, ExecutionSpec, NativeProvider};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        let sessions = SessionStore::new();
+        let session_id = SessionId("s_cap".into());
+        sessions.open(session_id.clone(), ws, EnforcementTier::DevNone, caps);
+
+        let provider = NativeProvider::new(
+            "test",
+            vec![CapabilityDescriptor {
+                name: "say_hi".into(),
+                desc: "Print a fixed greeting line for tests".into(),
+                signature: "say_hi(): string".into(),
+                schema: serde_json::json!({}),
+                exec: ExecutionSpec {
+                    program: "echo".into(),
+                    args_template: vec![CapabilityArg::Literal("hi".into())],
+                },
+            }],
+        )
+        .expect("native provider");
+        let mut registry = crate::ProviderRegistry::new();
+        registry.register(Box::new(provider)).expect("register");
+
+        let engine = JobEngine::new(
+            sessions,
+            JobStore::new(),
+            std::sync::Arc::new(std::sync::RwLock::new(registry)),
+        );
+        Harness {
+            engine,
+            session_id,
+            _dir: dir,
+        }
+    }
+
+    fn capability_req(session_id: &SessionId, name: &str) -> JobStartRequest {
+        JobStartRequest {
+            session_id: session_id.clone(),
             payload: JobPayload::Capability {
-                name: "git_diff".into(),
+                name: name.into(),
                 params: serde_json::json!({}),
             },
             cwd: None,
             capabilities: vec![],
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn capability_invocation_runs_and_captures_stdout() {
+        // The `tool:say_hi` grant ALONE (no proc.spawn) must authorize the tool.
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "say_hi".into(),
+        )]));
+        let req = capability_req(&h.session_id, "say_hi");
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert_eq!(status, JobStatus::Exited { code: 0 });
+        let out = collected_bytes(&h.engine, &id, LogStream::Stdout);
+        assert!(
+            out.windows(2).any(|w| w == b"hi"),
+            "stdout must contain `hi`, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_without_grant_is_denied() {
+        // Session holds only an unrelated tool grant — not `tool:say_hi`.
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "other".into(),
+        )]));
+        let req = capability_req(&h.session_id, "say_hi");
         let result = h.engine.start(&req).await;
         assert!(
-            matches!(result, Err(Error::NotImplemented(_))),
-            "expected NotImplemented for capability payload, got {result:?}"
+            matches!(result, Err(Error::CapabilityDenied { .. })),
+            "expected CapabilityDenied without the tool grant, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_unknown_name_is_not_found() {
+        // Grant passes (`tool:ghost`), but the registry has no such capability.
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "ghost".into(),
+        )]));
+        let req = capability_req(&h.session_id, "ghost");
+        let result = h.engine.start(&req).await;
+        assert!(
+            matches!(result, Err(Error::CapabilityNotFound { .. })),
+            "expected CapabilityNotFound for unknown capability, got {result:?}"
         );
     }
 
@@ -1166,7 +1315,11 @@ mod tests {
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
         );
         let jobs = JobStore::new();
-        let engine = JobEngine::new(sessions.clone(), jobs);
+        let engine = JobEngine::new(
+            sessions.clone(),
+            jobs,
+            std::sync::Arc::new(std::sync::RwLock::new(crate::ProviderRegistry::new())),
+        );
 
         let req = command_req(&session_id, "echo hi");
         let id = engine.start(&req).await.expect("start");
@@ -1221,7 +1374,11 @@ mod tests {
             EnforcementTier::KernelLsm,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
         );
-        let engine = JobEngine::new(sessions, JobStore::new());
+        let engine = JobEngine::new(
+            sessions,
+            JobStore::new(),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::ProviderRegistry::new())),
+        );
 
         // Negative: secret outside the workspace must NOT be readable.
         let req = command_req(&session_id, &format!("cat {}", secret.display()));
@@ -1272,7 +1429,11 @@ mod tests {
             EnforcementTier::KernelLsm,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
         );
-        let engine = JobEngine::new(sessions, JobStore::new());
+        let engine = JobEngine::new(
+            sessions,
+            JobStore::new(),
+            std::sync::Arc::new(std::sync::RwLock::new(crate::ProviderRegistry::new())),
+        );
         let req = command_req(&session_id, "echo hi");
         let result = engine.start(&req).await;
         assert!(
