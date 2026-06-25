@@ -1,9 +1,13 @@
-//! `axp-sandbox` — per-OS sandbox backends for AXP.
-//!
-//! This crate implements the sandboxing layer that constrains what a running
-//! agent process may do. Backends are OS-specific; the public surface exposed
-//! here is OS-agnostic.
+//! AXP sandbox backends. The Linux backend enforces a [`SandboxPolicy`] via
+//! Landlock (+ seccomp in a later unit) applied to a child process; other
+//! platforms are no-ops or refusals. (Enforcement is added incrementally —
+//! this unit is the scaffolding.)
+pub use axp_proto::EnforcementTier;
 
-mod tier;
+mod error;
+mod policy;
+mod probe;
 
-pub use tier::EnforcementTier;
+pub use error::{Result, SandboxError};
+pub use policy::SandboxPolicy;
+pub use probe::landlock_available;

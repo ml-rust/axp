@@ -19,6 +19,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 bytes = "1"
+landlock = "0.4"
 
 # Internal
 axp-proto = { path = "crates/axp-proto", version = "0.0.0" }
