@@ -12,6 +12,7 @@ axp-proto = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

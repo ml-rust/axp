@@ -85,6 +85,13 @@ pub enum Error {
     #[error("job not found: {0:?}")]
     JobNotFound(axp_proto::JobId),
 
+    /// A job's child process could not be spawned.
+    #[error("failed to spawn job process: {reason}")]
+    JobSpawn {
+        /// Human-readable reason for the spawn failure.
+        reason: String,
+    },
+
     /// A log push was rejected because the buffer would exceed its byte cap.
     #[error("log buffer overflow: exceeded {cap} bytes")]
     LogBufferOverflow {

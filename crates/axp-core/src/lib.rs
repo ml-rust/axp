@@ -26,7 +26,10 @@ mod workspace;
 
 pub use capability::{CapabilitySet, RuntimeCapability};
 pub use error::{Error, Result};
-pub use job::{Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq, resolve_cwd};
+pub use job::{
+    DEFAULT_LOG_BYTE_CAP, Job, JobEngine, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
+    resolve_cwd,
+};
 pub use provider::{CapabilityDescriptor, CapabilityListing, NativeProvider, Provider};
 pub use registry::ProviderRegistry;
 pub use session::{AuditEvent, AuditEventKind, Session, SessionStore};
