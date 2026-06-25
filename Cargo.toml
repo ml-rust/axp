@@ -22,11 +22,13 @@ bytes = "1"
 landlock = "0.4"
 seccompiler = "0.5"
 libc = "0.2"
+axum = "0.8"
 
 # Internal
 axp-proto = { path = "crates/axp-proto", version = "0.0.0" }
 axp-core = { path = "crates/axp-core", version = "0.0.0" }
 axp-sandbox = { path = "crates/axp-sandbox", version = "0.0.0" }
+axp-transport = { path = "crates/axp-transport", version = "0.0.0" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
