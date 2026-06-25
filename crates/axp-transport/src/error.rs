@@ -18,6 +18,14 @@ pub enum TransportError {
     /// The request body was not valid JSON or not a valid JSON-RPC object.
     #[error("parse error: {0}")]
     Parse(String),
+
+    /// A method parameter could not be decoded or failed a structural check.
+    #[error("invalid params: {0}")]
+    InvalidParams(String),
+
+    /// An unexpected internal error occurred in the transport layer.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 impl TransportError {
@@ -32,6 +40,10 @@ impl TransportError {
 
         let code = match self {
             TransportError::Parse(_) => PARSE_ERROR,
+
+            TransportError::InvalidParams(_) => INVALID_PARAMS,
+
+            TransportError::Internal(_) => INTERNAL_ERROR,
 
             TransportError::Runtime(core_err) => match core_err {
                 CoreError::SessionNotFound(_)

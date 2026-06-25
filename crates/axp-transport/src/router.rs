@@ -1,12 +1,12 @@
 //! Axum router and JSON-RPC dispatcher.
 //!
-//! Exposes a single `POST /` endpoint that speaks JSON-RPC 2.0.  Until method
-//! handlers are wired (unit U7b), every method returns `-32601 Method not
-//! found`.
+//! Exposes a single `POST /` endpoint that speaks JSON-RPC 2.0.  The
+//! `dispatch` function routes each method to its handler in [`crate::handlers`].
 
 use axum::{Json, extract::State, response::IntoResponse, routing};
 
 use crate::{
+    handlers,
     jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR},
     state::AppState,
 };
@@ -48,31 +48,49 @@ async fn rpc_handler(State(state): State<AppState>, body: axum::body::Bytes) -> 
 
 /// Dispatch a parsed JSON-RPC request to the appropriate method handler.
 ///
-/// Currently all known methods fall through to the `_` arm and return
-/// `-32601 Method not found`.  Unit U7b replaces the individual arms with real
-/// handlers.
+/// Each known method delegates to its handler in [`crate::handlers`].  The
+/// result of the handler (`Ok(Value)` or `Err(TransportError)`) is converted
+/// into a [`JsonRpcResponse`] with the echoed request id.
+///
+/// `job.attach` is stubbed as `METHOD_NOT_FOUND` — it requires the SSE
+/// endpoint added in unit U7c.
 ///
 /// The response id always echoes the request id (`null` when absent).
 pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse {
     let id = req.id.unwrap_or(serde_json::Value::Null);
 
-    // U7b will add arms for: "session.open", "axp.index", "axp.describe",
-    // "job.start", "job.attach", "job.status", "job.cancel". Until then every
-    // method returns -32601. The match (with only the `_` arm for now) is the
-    // dispatch table U7b fills in, hence the temporary single-binding allow.
-    #[allow(clippy::match_single_binding)]
-    match req.method.as_str() {
+    let result = match req.method.as_str() {
+        "session.open" => handlers::session_open(state, req.params).await,
+        "axp.index" => handlers::index(state, req.params).await,
+        "axp.describe" => handlers::describe(state, req.params).await,
+        "job.start" => handlers::job_start(state, req.params).await,
+        "job.status" => handlers::job_status(state, req.params).await,
+        "job.cancel" => handlers::job_cancel(state, req.params).await,
+        "job.attach" => {
+            return JsonRpcResponse::error(
+                id,
+                JsonRpcError {
+                    code: METHOD_NOT_FOUND,
+                    message: "job.attach requires the SSE endpoint (added in U7c)".into(),
+                    data: None,
+                },
+            );
+        }
         _ => {
-            let _ = state; // state will be used by real handlers in U7b
-            JsonRpcResponse::error(
+            return JsonRpcResponse::error(
                 id,
                 JsonRpcError {
                     code: METHOD_NOT_FOUND,
                     message: format!("method not found: {}", req.method),
                     data: None,
                 },
-            )
+            );
         }
+    };
+
+    match result {
+        Ok(v) => JsonRpcResponse::success(id, v),
+        Err(te) => JsonRpcResponse::error(id, te.to_jsonrpc_error()),
     }
 }
 
@@ -100,19 +118,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_method_returns_method_not_found() {
+    async fn completely_unknown_method_returns_method_not_found() {
         let state = make_state();
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(1)),
-            method: "axp.index".into(),
+            method: "completely.unknown".into(),
             params: serde_json::Value::Null,
         };
         let resp = dispatch(&state, req).await;
         let s = serde_json::to_string(&resp).unwrap();
         assert!(s.contains("-32601"), "expected METHOD_NOT_FOUND code: {s}");
         assert!(
-            s.contains("axp.index"),
+            s.contains("completely.unknown"),
             "expected method name in message: {s}"
         );
     }
@@ -120,10 +138,12 @@ mod tests {
     #[tokio::test]
     async fn response_id_echoes_request_id() {
         let state = make_state();
+        // Use a completely unknown method so the id-echo invariant is easy to
+        // check without worrying about params decoding.
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: Some(json!(99)),
-            method: "session.open".into(),
+            method: "no.such.method".into(),
             params: serde_json::Value::Null,
         };
         let resp = dispatch(&state, req).await;
@@ -136,7 +156,7 @@ mod tests {
         let req = JsonRpcRequest {
             jsonrpc: "2.0".into(),
             id: None,
-            method: "job.start".into(),
+            method: "no.such.method".into(),
             params: serde_json::Value::Null,
         };
         let resp = dispatch(&state, req).await;
@@ -144,31 +164,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_known_methods_return_method_not_found() {
+    async fn job_attach_returns_method_not_found_with_u7c_message() {
         let state = make_state();
-        let methods = [
-            "session.open",
-            "axp.index",
-            "axp.describe",
-            "job.start",
-            "job.attach",
-            "job.status",
-            "job.cancel",
-            "completely.unknown",
-        ];
-        for method in methods {
-            let req = JsonRpcRequest {
-                jsonrpc: "2.0".into(),
-                id: Some(json!(1)),
-                method: method.into(),
-                params: serde_json::Value::Null,
-            };
-            let resp = dispatch(&state, req).await;
-            let s = serde_json::to_string(&resp).unwrap();
-            assert!(
-                s.contains(&METHOD_NOT_FOUND.to_string()),
-                "method {method}: expected -32601, got: {s}"
-            );
-        }
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "job.attach".into(),
+            params: serde_json::Value::Null,
+        };
+        let resp = dispatch(&state, req).await;
+        let s = serde_json::to_string(&resp).unwrap();
+        assert!(
+            s.contains(&METHOD_NOT_FOUND.to_string()),
+            "expected METHOD_NOT_FOUND for job.attach: {s}"
+        );
+        assert!(
+            s.contains("U7c"),
+            "expected U7c reference in job.attach message: {s}"
+        );
     }
 }

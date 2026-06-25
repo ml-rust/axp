@@ -1,10 +1,11 @@
 //! `axp-transport` — JSON-RPC-2.0-over-HTTP transport for AXP.
 //!
 //! This crate provides the wire-protocol layer: envelope types, error mapping,
-//! shared application state, and the axum router.  It does not contain method
-//! handlers (those are unit U7b) or a server run-loop (unit U7d).
+//! shared application state, the axum router, and the six core JSON-RPC method
+//! handlers.  A server run-loop is added in unit U7d.
 
 mod error;
+mod handlers;
 mod jsonrpc;
 mod router;
 mod state;
