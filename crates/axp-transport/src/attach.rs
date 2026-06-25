@@ -21,7 +21,7 @@ use serde::Deserialize;
 
 use crate::{
     TransportError,
-    jsonrpc::{DENIED, INVALID_PARAMS, NOT_FOUND},
+    jsonrpc::{DENIED, INVALID_PARAMS, NOT_FOUND, UNAUTHORIZED},
     state::AppState,
 };
 
@@ -45,6 +45,10 @@ const _: fn() = || {
 pub(crate) struct AttachParams {
     /// Session that owns the job (must match the job's owner).
     session_id: String,
+    /// Opaque capability token proving authority over the session (from
+    /// session.open). REQUIRED: a missing `cap_token` query param makes the
+    /// `Query` extractor reject the request with HTTP 400.
+    cap_token: String,
     /// Job to attach to.
     job_id: String,
     /// Resume from this sequence number. Defaults to `0` (from the beginning).
@@ -80,6 +84,7 @@ impl axum::response::IntoResponse for AttachError {
         let status = match err.code {
             NOT_FOUND => StatusCode::NOT_FOUND,
             DENIED => StatusCode::FORBIDDEN,
+            UNAUTHORIZED => StatusCode::UNAUTHORIZED,
             INVALID_PARAMS => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -113,7 +118,8 @@ pub(crate) async fn attach_sse(
     Query(params): Query<AttachParams>,
     headers: HeaderMap,
 ) -> Result<Response, AttachError> {
-    // `Last-Event-ID` overrides the query-param offset (standard SSE resume).
+    // Build the typed request first so `session_id` can be borrowed for the
+    // auth check and then moved into the engine call — avoids an extra clone.
     let from_offset = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -122,9 +128,19 @@ pub(crate) async fn attach_sse(
 
     let req = axp_proto::JobAttachRequest {
         session_id: axp_proto::SessionId(params.session_id),
+        cap_token: params.cap_token,
         job_id: axp_proto::JobId(params.job_id),
         from_offset,
     };
+
+    // Authenticate BEFORE touching the engine. The capability token arrives as
+    // a query param (not a header) because the browser `EventSource` API cannot
+    // set custom headers, so a query-param token is the standard auth mechanism
+    // for SSE. Unknown session and bad token are rejected identically
+    // (UNAUTHORIZED) — no existence oracle.
+    if !state.sessions.authorize(&req.session_id, &req.cap_token) {
+        return Err(AttachError::from(TransportError::Unauthorized));
+    }
 
     let mut stream = state.engine.attach(&req)?;
 
@@ -179,21 +195,29 @@ mod tests {
     }
 
     /// Build a `dev-none` session with `proc.spawn` over a tempdir, start an
-    /// `echo hello` job, poll it to terminal, and return `(state, sid, jid, dir)`.
-    async fn finished_job() -> (AppState, SessionId, JobId, tempfile::TempDir) {
+    /// `echo hello` job, poll it to terminal, and return
+    /// `(state, sid, token, jid, dir)`. The `token` is the capability token the
+    /// session was opened with — the same value every authenticated call (and
+    /// the SSE attach endpoint) must present.
+    async fn finished_job() -> (AppState, SessionId, String, JobId, tempfile::TempDir) {
         let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
         let ws = Workspace::new(dir.path()).expect("workspace");
         let sid = SessionId("s_attach".into());
+        // Mint the token here and keep a copy of its exposed string BEFORE moving
+        // the `CapToken` into `open()`, so the test can present the matching token.
+        let cap_token = CapToken::generate().expect("entropy");
+        let token = cap_token.expose().to_owned();
         state.sessions.open(
             sid.clone(),
             ws,
             EnforcementTier::DevNone,
             CapabilitySet::new(vec![RuntimeCapability::ProcSpawn]),
-            CapToken::generate().expect("entropy"),
+            cap_token,
         );
         let req = JobStartRequest {
             session_id: sid.clone(),
+            cap_token: token.clone(),
             payload: JobPayload::Command {
                 command: "echo hello".into(),
             },
@@ -202,7 +226,7 @@ mod tests {
         };
         let jid = state.engine.start(&req).await.expect("start");
         poll_terminal(&state, &jid).await;
-        (state, sid, jid, dir)
+        (state, sid, token, jid, dir)
     }
 
     /// Parse an SSE response body, decode each `data:` line back into a
@@ -223,9 +247,12 @@ mod tests {
 
     #[tokio::test]
     async fn attach_streams_terminal_job_as_sse() {
-        let (state, sid, jid, _dir) = finished_job().await;
+        let (state, sid, token, jid, _dir) = finished_job().await;
         let router = build_router(state);
-        let uri = format!("/job/attach?session_id={}&job_id={}", sid.0, jid.0);
+        let uri = format!(
+            "/job/attach?session_id={}&cap_token={}&job_id={}",
+            sid.0, token, jid.0
+        );
         let resp = router
             .oneshot(
                 Request::builder()
@@ -262,13 +289,13 @@ mod tests {
 
     #[tokio::test]
     async fn attach_resume_past_last_seq_omits_earlier_frames() {
-        let (state, sid, jid, _dir) = finished_job().await;
+        let (state, sid, token, jid, _dir) = finished_job().await;
         let router = build_router(state);
         // Resume from a very high offset: every existing frame is before it, so
         // the replayed body must not contain the `hello` payload.
         let uri = format!(
-            "/job/attach?session_id={}&job_id={}&from_offset=1000000",
-            sid.0, jid.0
+            "/job/attach?session_id={}&cap_token={}&job_id={}&from_offset=1000000",
+            sid.0, token, jid.0
         );
         let resp = router
             .oneshot(
@@ -292,13 +319,13 @@ mod tests {
 
     #[tokio::test]
     async fn attach_last_event_id_header_overrides_from_offset() {
-        let (state, sid, jid, _dir) = finished_job().await;
+        let (state, sid, token, jid, _dir) = finished_job().await;
         let router = build_router(state);
         // from_offset=0 would replay everything, but Last-Event-ID past the end
         // must win and suppress the replay.
         let uri = format!(
-            "/job/attach?session_id={}&job_id={}&from_offset=0",
-            sid.0, jid.0
+            "/job/attach?session_id={}&cap_token={}&job_id={}&from_offset=0",
+            sid.0, token, jid.0
         );
         let resp = router
             .oneshot(
@@ -323,9 +350,12 @@ mod tests {
 
     #[tokio::test]
     async fn attach_unknown_job_returns_not_found() {
-        let (state, sid, _jid, _dir) = finished_job().await;
+        let (state, sid, token, _jid, _dir) = finished_job().await;
         let router = build_router(state);
-        let uri = format!("/job/attach?session_id={}&job_id=j_nope", sid.0);
+        let uri = format!(
+            "/job/attach?session_id={}&cap_token={}&job_id=j_nope",
+            sid.0, token
+        );
         let resp = router
             .oneshot(
                 Request::builder()
@@ -337,5 +367,46 @@ mod tests {
             .expect("response");
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attach_bad_token_does_not_stream_logs() {
+        // A valid session+job but a WRONG cap_token must be rejected before the
+        // log stream is built: the response must not be a 200 SSE stream.
+        let (state, sid, _token, jid, _dir) = finished_job().await;
+        let router = build_router(state);
+        let uri = format!(
+            "/job/attach?session_id={}&cap_token=ct_wrong_token&job_id={}",
+            sid.0, jid.0
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "bad token must not yield a 200 log stream"
+        );
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "bad token must map to HTTP 401 Unauthorized"
+        );
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !ctype.contains("text/event-stream"),
+            "bad token must not open an SSE stream, got content-type: {ctype}"
+        );
     }
 }

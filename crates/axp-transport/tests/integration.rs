@@ -135,14 +135,9 @@ fn collected_log_bytes(body: &str) -> Vec<u8> {
     out
 }
 
-/// Open a session, start a short-lived job, poll it to a terminal state, and
-/// return `(session_id, job_id)`.  The caller must hold the `TempDir` alive.
-async fn started_finished_job(
-    client: &reqwest::Client,
-    base: &str,
-    workspace: &str,
-) -> (String, String) {
-    // session.open
+/// Open a `dev-none` session with `proc.spawn` over `workspace` and return
+/// `(session_id, cap_token)`. The caller must hold the `TempDir` alive.
+async fn open_session(client: &reqwest::Client, base: &str, workspace: &str) -> (String, String) {
     let open = rpc(
         client,
         base,
@@ -162,6 +157,23 @@ async fn started_finished_job(
         .as_str()
         .expect("session_id string")
         .to_owned();
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token string")
+        .to_owned();
+    (sid, token)
+}
+
+/// Open a session, start a short-lived job, poll it to a terminal state, and
+/// return `(session_id, cap_token, job_id)`.  The caller must hold the `TempDir`
+/// alive. The `cap_token` is the credential every authenticated call must
+/// present.
+async fn started_finished_job(
+    client: &reqwest::Client,
+    base: &str,
+    workspace: &str,
+) -> (String, String, String) {
+    let (sid, token) = open_session(client, base, workspace).await;
 
     // job.start — `printf` for portability; `sh -c` is the engine's shell.
     let start = rpc(
@@ -170,6 +182,7 @@ async fn started_finished_job(
         "job.start",
         serde_json::json!({
             "session_id": sid,
+            "cap_token": token,
             "kind": "command",
             "command": "printf 'alpha\\nbeta\\ngamma\\n'",
         }),
@@ -191,7 +204,7 @@ async fn started_finished_job(
             client,
             base,
             "job.status",
-            serde_json::json!({"session_id": sid, "job_id": jid}),
+            serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
         )
         .await;
         assert!(
@@ -214,7 +227,7 @@ async fn started_finished_job(
         "job {jid} did not reach a terminal state within the polling timeout"
     );
 
-    (sid, jid)
+    (sid, token, jid)
 }
 
 // ── Test 1: full happy-path flow ───────────────────────────────────────────────
@@ -257,6 +270,9 @@ async fn end_to_end_session_job_attach_status() {
         open["result"]["cap_token"].is_string(),
         "cap_token must be present: {open}"
     );
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token must be a string");
 
     // ── 2. job.start ───────────────────────────────────────────────────────────
     // `JobStartRequest` flattens `JobPayload` via `#[serde(flatten)]`, so the
@@ -268,6 +284,7 @@ async fn end_to_end_session_job_attach_status() {
         "job.start",
         serde_json::json!({
             "session_id": sid,
+            "cap_token": token,
             "kind": "command",
             "command": "printf 'alpha\\nbeta\\ngamma\\n'",
         }),
@@ -296,7 +313,7 @@ async fn end_to_end_session_job_attach_status() {
             &client,
             &base,
             "job.status",
-            serde_json::json!({"session_id": sid, "job_id": jid}),
+            serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
         )
         .await;
         assert!(
@@ -334,7 +351,9 @@ async fn end_to_end_session_job_attach_status() {
     // The job is already terminal so the SSE stream drains the log buffer and
     // closes.  `.text()` is therefore safe (will not block indefinitely).
     let attach_resp = client
-        .get(format!("{base}/job/attach?session_id={sid}&job_id={jid}"))
+        .get(format!(
+            "{base}/job/attach?session_id={sid}&cap_token={token}&job_id={jid}"
+        ))
         .send()
         .await
         .expect("GET /job/attach");
@@ -381,7 +400,7 @@ async fn end_to_end_session_job_attach_status() {
         &client,
         &base,
         "job.cancel",
-        serde_json::json!({"session_id": sid, "job_id": jid}),
+        serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
     )
     .await;
     assert!(
@@ -403,12 +422,12 @@ async fn attach_resume_past_end_yields_no_frames() {
     let client = reqwest::Client::new();
     let workspace = dir.path().to_str().expect("workspace path utf-8");
 
-    let (sid, jid) = started_finished_job(&client, &base, workspace).await;
+    let (sid, token, jid) = started_finished_job(&client, &base, workspace).await;
 
     // 2a. from_offset way past the end via query param.
     let resp_qp = client
         .get(format!(
-            "{base}/job/attach?session_id={sid}&job_id={jid}&from_offset=1000000"
+            "{base}/job/attach?session_id={sid}&cap_token={token}&job_id={jid}&from_offset=1000000"
         ))
         .send()
         .await
@@ -424,7 +443,7 @@ async fn attach_resume_past_end_yields_no_frames() {
     //     header override is the only thing suppressing replay).
     let resp_hdr = client
         .get(format!(
-            "{base}/job/attach?session_id={sid}&job_id={jid}&from_offset=0"
+            "{base}/job/attach?session_id={sid}&cap_token={token}&job_id={jid}&from_offset=0"
         ))
         .header("last-event-id", "1000000")
         .send()
@@ -438,19 +457,21 @@ async fn attach_resume_past_end_yields_no_frames() {
     );
 }
 
-// ── Test 3: unknown session → JSON-RPC NOT_FOUND (-32001) ─────────────────────
+// ── Test 3: unknown session → JSON-RPC UNAUTHORIZED (-32004) ──────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unknown_session_index_returns_jsonrpc_not_found() {
+async fn unknown_session_index_returns_unauthorized() {
     let (base, _dir) = spawn_server().await;
     let client = reqwest::Client::new();
 
-    // `axp.index` validates the session id first; an unknown id → NOT_FOUND.
+    // `axp.index` authenticates first. An unknown session is deliberately
+    // indistinguishable from a bad token: both yield UNAUTHORIZED so an attacker
+    // cannot learn whether the session id exists (no existence oracle).
     let resp = rpc(
         &client,
         &base,
         "axp.index",
-        serde_json::json!({"session_id": "s_nope"}),
+        serde_json::json!({"session_id": "s_nope", "cap_token": "ct_whatever"}),
     )
     .await;
 
@@ -468,8 +489,8 @@ async fn unknown_session_index_returns_jsonrpc_not_found() {
         .expect("error.code must be an integer");
     assert_eq!(
         code,
-        axp_transport::NOT_FOUND,
-        "expected NOT_FOUND (-32001), got code: {code} in response: {resp}"
+        axp_transport::UNAUTHORIZED,
+        "expected UNAUTHORIZED (-32004), got code: {code} in response: {resp}"
     );
 }
 
@@ -503,6 +524,10 @@ async fn capability_invocation_over_http_runs_and_streams() {
         .as_str()
         .expect("session_id string")
         .to_owned();
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token string")
+        .to_owned();
 
     // ── 2. job.start — invoke the say_hi capability ────────────────────────────
     let start = rpc(
@@ -511,6 +536,7 @@ async fn capability_invocation_over_http_runs_and_streams() {
         "job.start",
         serde_json::json!({
             "session_id": sid,
+            "cap_token": token,
             "kind": "capability",
             "name": "say_hi",
             "params": {},
@@ -533,7 +559,7 @@ async fn capability_invocation_over_http_runs_and_streams() {
             &client,
             &base,
             "job.status",
-            serde_json::json!({"session_id": sid, "job_id": jid}),
+            serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
         )
         .await;
         assert!(
@@ -566,7 +592,9 @@ async fn capability_invocation_over_http_runs_and_streams() {
     // ── 4. GET /job/attach — finite SSE replay must contain "hi" ──────────────
     // Poll to terminal before attaching so the stream drains and closes (safe to call .text()).
     let attach_resp = client
-        .get(format!("{base}/job/attach?session_id={sid}&job_id={jid}"))
+        .get(format!(
+            "{base}/job/attach?session_id={sid}&cap_token={token}&job_id={jid}"
+        ))
         .send()
         .await
         .expect("GET /job/attach");
@@ -631,6 +659,10 @@ async fn read_file_capability_reads_file_contents_over_http() {
         .as_str()
         .expect("session_id string")
         .to_owned();
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token string")
+        .to_owned();
 
     // ── 2. job.start — invoke read_file with the path param ───────────────────
     let start = rpc(
@@ -639,6 +671,7 @@ async fn read_file_capability_reads_file_contents_over_http() {
         "job.start",
         serde_json::json!({
             "session_id": sid,
+            "cap_token": token,
             "kind": "capability",
             "name": "read_file",
             "params": {"path": abs_path},
@@ -661,7 +694,7 @@ async fn read_file_capability_reads_file_contents_over_http() {
             &client,
             &base,
             "job.status",
-            serde_json::json!({"session_id": sid, "job_id": jid}),
+            serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
         )
         .await;
         assert!(
@@ -692,7 +725,9 @@ async fn read_file_capability_reads_file_contents_over_http() {
 
     // ── 4. GET /job/attach — SSE replay must contain the file contents ────────
     let attach_resp = client
-        .get(format!("{base}/job/attach?session_id={sid}&job_id={jid}"))
+        .get(format!(
+            "{base}/job/attach?session_id={sid}&cap_token={token}&job_id={jid}"
+        ))
         .send()
         .await
         .expect("GET /job/attach");
@@ -737,6 +772,10 @@ async fn capability_invocation_without_grant_is_denied_over_http() {
         .as_str()
         .expect("session_id string")
         .to_owned();
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token string")
+        .to_owned();
 
     // job.start capability invocation — must be denied because tool:say_hi is not granted.
     let start = rpc(
@@ -745,6 +784,7 @@ async fn capability_invocation_without_grant_is_denied_over_http() {
         "job.start",
         serde_json::json!({
             "session_id": sid,
+            "cap_token": token,
             "kind": "capability",
             "name": "say_hi",
             "params": {},
@@ -771,4 +811,180 @@ async fn capability_invocation_without_grant_is_denied_over_http() {
     );
 
     let _dir = dir; // keep TempDir alive until end of test
+}
+
+// ── Security: bad token at an authenticated endpoint → UNAUTHORIZED ────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn index_with_wrong_cap_token_returns_unauthorized() {
+    let (base, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    // Open a real session (so the session id IS known), then present the correct
+    // session id with a WRONG token. The gate must reject with UNAUTHORIZED —
+    // identical to the unknown-session case — proving the token, not the
+    // (guessable) session id, is the authority.
+    let (sid, _token) = open_session(&client, &base, workspace).await;
+
+    let resp = rpc(
+        &client,
+        &base,
+        "axp.index",
+        serde_json::json!({"session_id": sid, "cap_token": "ct_deadbeefdeadbeef"}),
+    )
+    .await;
+
+    assert!(
+        resp.get("error").is_some(),
+        "expected JSON-RPC error for wrong token, got: {resp}"
+    );
+    let code = resp["error"]["code"]
+        .as_i64()
+        .expect("error.code must be an integer");
+    assert_eq!(
+        code,
+        axp_transport::UNAUTHORIZED,
+        "wrong cap_token must yield UNAUTHORIZED, got code: {code} in: {resp}"
+    );
+}
+
+// ── Security: missing token field → INVALID_PARAMS (required-field deser fail) ─
+
+#[tokio::test(flavor = "multi_thread")]
+async fn index_without_cap_token_field_errors() {
+    let (base, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    let (sid, _token) = open_session(&client, &base, workspace).await;
+
+    // No `cap_token` field at all: `cap_token` is a required field, so the
+    // request fails to deserialize before the gate runs → INVALID_PARAMS.
+    let resp = rpc(
+        &client,
+        &base,
+        "axp.index",
+        serde_json::json!({"session_id": sid}),
+    )
+    .await;
+
+    assert!(
+        resp.get("error").is_some(),
+        "expected JSON-RPC error for missing cap_token, got: {resp}"
+    );
+    let code = resp["error"]["code"]
+        .as_i64()
+        .expect("error.code must be an integer");
+    assert_eq!(
+        code,
+        axp_transport::INVALID_PARAMS,
+        "missing cap_token must yield INVALID_PARAMS, got code: {code} in: {resp}"
+    );
+}
+
+// ── Security: cross-session isolation — token is the authority boundary ────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cross_session_token_is_the_authority_boundary() {
+    let (base, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    // Session A: open + start a job (poll to terminal).
+    let (sid_a, token_a, jid_a) = started_finished_job(&client, &base, workspace).await;
+
+    // Session B: a separate authenticated session.
+    let (sid_b, token_b) = open_session(&client, &base, workspace).await;
+    assert_ne!(
+        token_a, token_b,
+        "distinct sessions must have distinct tokens"
+    );
+
+    // 1. B asks about A's job using B's OWN (valid) session+token. B authenticates
+    //    fine, but does not own A's job → NOT_FOUND (job ownership is enforced by
+    //    the engine, independent of authentication).
+    let cross = rpc(
+        &client,
+        &base,
+        "job.status",
+        serde_json::json!({"session_id": sid_b, "cap_token": token_b, "job_id": jid_a}),
+    )
+    .await;
+    assert!(
+        cross.get("result").is_none(),
+        "B must not see A's job as a success: {cross}"
+    );
+    let cross_code = cross["error"]["code"]
+        .as_i64()
+        .expect("error.code must be an integer");
+    assert_eq!(
+        cross_code,
+        axp_transport::NOT_FOUND,
+        "B querying A's job (with B's own token) must be NOT_FOUND, got: {cross}"
+    );
+
+    // 2. B tries to ACT AS A: A's session id + A's job, but B's WRONG token. The
+    //    auth gate rejects this before ownership is even considered → UNAUTHORIZED.
+    //    This proves the token — not the guessable session id — is the boundary.
+    let impersonate = rpc(
+        &client,
+        &base,
+        "job.status",
+        serde_json::json!({"session_id": sid_a, "cap_token": token_b, "job_id": jid_a}),
+    )
+    .await;
+    assert!(
+        impersonate.get("result").is_none(),
+        "B impersonating A must not succeed: {impersonate}"
+    );
+    let imp_code = impersonate["error"]["code"]
+        .as_i64()
+        .expect("error.code must be an integer");
+    assert_eq!(
+        imp_code,
+        axp_transport::UNAUTHORIZED,
+        "B's token cannot act as A's session, got: {impersonate}"
+    );
+}
+
+// ── Security: attach with a wrong token must not stream logs ───────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_with_wrong_cap_token_does_not_stream() {
+    let (base, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    let (sid, _token, jid) = started_finished_job(&client, &base, workspace).await;
+
+    // Valid session + valid job, but a WRONG cap_token in the query param: the
+    // attach endpoint must reject before building the log stream — not a 200 SSE.
+    let resp = client
+        .get(format!(
+            "{base}/job/attach?session_id={sid}&cap_token=ct_wrong_token&job_id={jid}"
+        ))
+        .send()
+        .await
+        .expect("GET /job/attach (wrong token)");
+
+    assert_ne!(
+        resp.status(),
+        200,
+        "wrong cap_token must not yield a 200 log stream"
+    );
+    assert_eq!(
+        resp.status(),
+        401,
+        "wrong cap_token must map to HTTP 401 Unauthorized"
+    );
+    let ctype = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !ctype.contains("text/event-stream"),
+        "wrong token must not open an SSE stream, got content-type: {ctype}"
+    );
 }

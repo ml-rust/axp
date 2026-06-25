@@ -26,6 +26,8 @@ pub struct CapabilityDetail {
 pub struct IndexRequest {
     /// The session to query capabilities for.
     pub session_id: SessionId,
+    /// Opaque capability token proving authority over the session (from session.open).
+    pub cap_token: String,
 }
 
 /// `axp.index` response — the full catalog as name+description pairs.
@@ -42,6 +44,8 @@ pub struct IndexResponse {
 pub struct DescribeRequest {
     /// The session whose catalog to query.
     pub session_id: SessionId,
+    /// Opaque capability token proving authority over the session (from session.open).
+    pub cap_token: String,
     /// The name of the capability to describe.
     pub name: String,
 }

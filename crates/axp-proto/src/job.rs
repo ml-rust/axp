@@ -44,6 +44,8 @@ pub enum JobPayload {
 pub struct JobStartRequest {
     /// The session this job runs within.
     pub session_id: SessionId,
+    /// Opaque capability token proving authority over the session (from session.open).
+    pub cap_token: String,
     /// The work to run; its `kind`/fields are flattened into this object on the wire.
     #[serde(flatten)]
     pub payload: JobPayload,
@@ -108,6 +110,8 @@ pub struct LogEventFrame {
 pub struct JobAttachRequest {
     /// The session the caller is operating within (must own the job).
     pub session_id: SessionId,
+    /// Opaque capability token proving authority over the session (from session.open).
+    pub cap_token: String,
     /// The job to attach to.
     pub job_id: JobId,
     /// Resume from this sequence number (0 = from the beginning). `Last-Event-ID` semantics.
@@ -120,6 +124,8 @@ pub struct JobAttachRequest {
 pub struct JobStatusRequest {
     /// The session the caller is operating within (must own the job).
     pub session_id: SessionId,
+    /// Opaque capability token proving authority over the session (from session.open).
+    pub cap_token: String,
     /// The job to report on.
     pub job_id: JobId,
 }
@@ -140,6 +146,8 @@ pub struct JobStatusResponse {
 pub struct JobCancelRequest {
     /// The session the caller is operating within (must own the job).
     pub session_id: SessionId,
+    /// Opaque capability token proving authority over the session (from session.open).
+    pub cap_token: String,
     /// The job to cancel.
     pub job_id: JobId,
 }
@@ -159,6 +167,7 @@ mod tests {
     fn command_payload_flattens_into_request() {
         let req = JobStartRequest {
             session_id: SessionId("s_91".into()),
+            cap_token: "ct_secret".into(),
             payload: JobPayload::Command {
                 command: "git diff".into(),
             },
@@ -170,6 +179,7 @@ mod tests {
             value,
             serde_json::json!({
                 "session_id": "s_91",
+                "cap_token": "ct_secret",
                 "kind": "command",
                 "command": "git diff"
             })
@@ -180,6 +190,7 @@ mod tests {
     fn command_payload_round_trips() {
         let req = JobStartRequest {
             session_id: SessionId("s_91".into()),
+            cap_token: "ct_secret".into(),
             payload: JobPayload::Command {
                 command: "git diff".into(),
             },
@@ -195,6 +206,7 @@ mod tests {
     fn code_payload_with_lang_round_trips() {
         let req = JobStartRequest {
             session_id: SessionId("s_1".into()),
+            cap_token: "ct_secret".into(),
             payload: JobPayload::Code {
                 code: "print(1)".into(),
                 lang: Some("python".into()),
@@ -206,6 +218,7 @@ mod tests {
         assert_eq!(value["kind"], "code");
         assert_eq!(value["lang"], "python");
         assert_eq!(value["cwd"], "sub");
+        assert_eq!(value["cap_token"], "ct_secret");
         let req2: JobStartRequest = serde_json::from_value(value).unwrap();
         assert_eq!(req, req2);
     }
@@ -214,6 +227,7 @@ mod tests {
     fn code_payload_without_lang_omits_field() {
         let req = JobStartRequest {
             session_id: SessionId("s_1".into()),
+            cap_token: "ct_secret".into(),
             payload: JobPayload::Code {
                 code: "print(1)".into(),
                 lang: None,
@@ -296,6 +310,7 @@ mod tests {
     fn job_attach_request_from_offset_defaults_to_zero() {
         let json = serde_json::json!({
             "session_id": "s_1",
+            "cap_token": "ct_secret",
             "job_id": "j_1"
         });
         let req: JobAttachRequest = serde_json::from_value(json).unwrap();
@@ -303,6 +318,7 @@ mod tests {
         // And a full round trip preserves an explicit offset.
         let req2 = JobAttachRequest {
             session_id: SessionId("s_1".into()),
+            cap_token: "ct_secret".into(),
             job_id: JobId("j_1".into()),
             from_offset: 42,
         };
@@ -327,6 +343,7 @@ mod tests {
     fn job_cancel_request_round_trips() {
         let req = JobCancelRequest {
             session_id: SessionId("s_1".into()),
+            cap_token: "ct_secret".into(),
             job_id: JobId("j_1".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -354,6 +371,7 @@ mod tests {
     fn job_payload_capability_round_trips() {
         let req = JobStartRequest {
             session_id: SessionId("s_1".into()),
+            cap_token: "ct_secret".into(),
             payload: JobPayload::Capability {
                 name: "git_diff".into(),
                 params: serde_json::json!({}),
@@ -367,5 +385,48 @@ mod tests {
         assert_eq!(value["params"], serde_json::json!({}));
         let req2: JobStartRequest = serde_json::from_value(value).unwrap();
         assert_eq!(req, req2);
+    }
+
+    #[test]
+    fn job_start_cap_token_survives_flatten_for_each_variant() {
+        // `cap_token` is declared after `session_id` and before the
+        // `#[serde(flatten)] payload`, so it must serialize as a top-level
+        // sibling of the flattened payload fields and round-trip cleanly for
+        // every payload variant — proving the flatten does not swallow it.
+        let variants = [
+            JobPayload::Command {
+                command: "git diff".into(),
+            },
+            JobPayload::Code {
+                code: "print(1)".into(),
+                lang: Some("python".into()),
+            },
+            JobPayload::Capability {
+                name: "git_diff".into(),
+                params: serde_json::json!({"flag": true}),
+            },
+        ];
+        for payload in variants {
+            let req = JobStartRequest {
+                session_id: SessionId("s_1".into()),
+                cap_token: "ct_authority".into(),
+                payload,
+                cwd: None,
+                capabilities: vec![],
+            };
+            let value = serde_json::to_value(&req).unwrap();
+            // `cap_token` is a top-level field next to `session_id` and `kind`.
+            assert_eq!(
+                value["cap_token"], "ct_authority",
+                "cap_token must serialize at the top level: {value}"
+            );
+            assert!(
+                value.get("kind").is_some(),
+                "flattened kind missing: {value}"
+            );
+            let req2: JobStartRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(req, req2, "round-trip must preserve cap_token and payload");
+            assert_eq!(req2.cap_token, "ct_authority");
+        }
     }
 }

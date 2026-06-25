@@ -2,6 +2,7 @@
 
 use crate::jsonrpc::{
     DENIED, INTERNAL_ERROR, INVALID_PARAMS, JsonRpcError, NOT_FOUND, NOT_IMPLEMENTED, PARSE_ERROR,
+    UNAUTHORIZED,
 };
 
 /// Failure modes for the transport layer.
@@ -23,6 +24,15 @@ pub enum TransportError {
     #[error("invalid params: {0}")]
     InvalidParams(String),
 
+    /// Authentication/authorization failed: the session is unknown or the
+    /// presented capability token is invalid.
+    ///
+    /// The message is intentionally generic ("unauthorized") and identical for
+    /// both cases so that an attacker cannot use the error to discover whether a
+    /// given session id exists (no existence oracle).
+    #[error("unauthorized")]
+    Unauthorized,
+
     /// An unexpected internal error occurred in the transport layer.
     #[error("internal error: {0}")]
     Internal(String),
@@ -42,6 +52,8 @@ impl TransportError {
             TransportError::Parse(_) => PARSE_ERROR,
 
             TransportError::InvalidParams(_) => INVALID_PARAMS,
+
+            TransportError::Unauthorized => UNAUTHORIZED,
 
             TransportError::Internal(_) => INTERNAL_ERROR,
 
@@ -82,6 +94,7 @@ mod tests {
     use super::*;
     use crate::jsonrpc::{
         DENIED, INTERNAL_ERROR, INVALID_PARAMS, NOT_FOUND, NOT_IMPLEMENTED, PARSE_ERROR,
+        UNAUTHORIZED,
     };
 
     #[test]
@@ -138,6 +151,19 @@ mod tests {
             reason: "not a dir".into(),
         });
         assert_eq!(err.to_jsonrpc_error().code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn unauthorized_maps_to_unauthorized_code() {
+        let err = TransportError::Unauthorized;
+        assert_eq!(err.to_jsonrpc_error().code, UNAUTHORIZED);
+    }
+
+    #[test]
+    fn unauthorized_message_is_generic() {
+        // Must not reveal whether the session exists or the token was wrong.
+        let err = TransportError::Unauthorized;
+        assert_eq!(err.to_jsonrpc_error().message, "unauthorized");
     }
 
     #[test]

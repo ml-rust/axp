@@ -26,6 +26,9 @@ pub const NOT_FOUND: i64 = -32001;
 pub const DENIED: i64 = -32002;
 /// AXP application error: method or feature not yet implemented.
 pub const NOT_IMPLEMENTED: i64 = -32003;
+/// AXP application error: authentication/authorization failed (unknown session
+/// or invalid capability token).
+pub const UNAUTHORIZED: i64 = -32004;
 
 // ── JsonRpcRequest ─────────────────────────────────────────────────────────────
 

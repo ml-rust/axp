@@ -768,6 +768,10 @@ mod tests {
     fn command_req(session_id: &SessionId, command: &str) -> JobStartRequest {
         JobStartRequest {
             session_id: session_id.clone(),
+            // The engine never reads `cap_token` (authentication is enforced at
+            // the transport layer); a placeholder keeps these unit tests focused
+            // on engine behavior.
+            cap_token: "ct_test".into(),
             payload: JobPayload::Command {
                 command: command.into(),
             },
@@ -877,6 +881,7 @@ mod tests {
         let h = harness();
         let req = JobStartRequest {
             session_id: h.session_id.clone(),
+            cap_token: "ct_test".into(),
             payload: JobPayload::Code {
                 code: "x".into(),
                 lang: None,
@@ -943,6 +948,7 @@ mod tests {
     fn capability_req(session_id: &SessionId, name: &str) -> JobStartRequest {
         JobStartRequest {
             session_id: session_id.clone(),
+            cap_token: "ct_test".into(),
             payload: JobPayload::Capability {
                 name: name.into(),
                 params: serde_json::json!({}),
@@ -1006,6 +1012,7 @@ mod tests {
         // Cancel immediately so the test stays fast.
         let cancel_req = axp_proto::JobCancelRequest {
             session_id: h.session_id.clone(),
+            cap_token: "ct_test".into(),
             job_id: id.clone(),
         };
         let resp = h.engine.cancel(&cancel_req).expect("cancel");
@@ -1061,6 +1068,7 @@ mod tests {
     fn attach_req(session_id: &SessionId, job_id: &JobId, from_offset: u64) -> JobAttachRequest {
         JobAttachRequest {
             session_id: session_id.clone(),
+            cap_token: "ct_test".into(),
             job_id: job_id.clone(),
             from_offset,
         }
@@ -1069,6 +1077,7 @@ mod tests {
     fn status_req(session_id: &SessionId, job_id: &JobId) -> JobStatusRequest {
         JobStatusRequest {
             session_id: session_id.clone(),
+            cap_token: "ct_test".into(),
             job_id: job_id.clone(),
         }
     }
@@ -1246,6 +1255,7 @@ mod tests {
         let wrong = SessionId("s_wrong".into());
         let cancel_req = axp_proto::JobCancelRequest {
             session_id: wrong,
+            cap_token: "ct_test".into(),
             job_id: id.clone(),
         };
         let result = h.engine.cancel(&cancel_req);
@@ -1257,6 +1267,7 @@ mod tests {
         // Clean up: cancel the real job so the tokio task doesn't linger.
         let real_req = axp_proto::JobCancelRequest {
             session_id: h.session_id.clone(),
+            cap_token: "ct_test".into(),
             job_id: id.clone(),
         };
         let _ = h.engine.cancel(&real_req);
@@ -1273,6 +1284,7 @@ mod tests {
         // Job is finished — cancel should return ok=false (owned but already done).
         let cancel_req = axp_proto::JobCancelRequest {
             session_id: h.session_id.clone(),
+            cap_token: "ct_test".into(),
             job_id: id.clone(),
         };
         let resp = h

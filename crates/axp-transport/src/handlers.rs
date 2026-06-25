@@ -32,10 +32,22 @@ fn to_value<T: Serialize>(v: &T) -> Result<serde_json::Value, TransportError> {
     serde_json::to_value(v).map_err(|e| TransportError::Internal(e.to_string()))
 }
 
-/// Return `Ok(())` if `id` is a known session, otherwise `Err(SessionNotFound)`.
-fn require_session(state: &AppState, id: &SessionId) -> Result<(), TransportError> {
-    if state.sessions.get(id).is_none() {
-        return Err(axp_core::Error::SessionNotFound(id.clone()).into());
+/// Unified authentication gate for every authenticated method.
+///
+/// Returns `Ok(())` only when `id` names a known session AND `presented` matches
+/// that session's capability token. Both the unknown-session case and the
+/// wrong-token case return the SAME [`TransportError::Unauthorized`] with the
+/// same generic message, so an attacker cannot use the error to learn whether a
+/// given session id exists (no existence oracle). The underlying
+/// [`SessionStore::authorize`](axp_core::SessionStore::authorize) comparison is
+/// constant-time.
+fn require_authorized_session(
+    state: &AppState,
+    id: &SessionId,
+    presented: &str,
+) -> Result<(), TransportError> {
+    if !state.sessions.authorize(id, presented) {
+        return Err(TransportError::Unauthorized);
     }
     Ok(())
 }
@@ -80,14 +92,15 @@ pub(crate) async fn session_open(
 
 /// Handle `axp.index`: return the full capability catalog for a session.
 ///
-/// The session id is validated (unknown → `NOT_FOUND`) but the registry is
-/// global for now; it is not yet scoped per session.
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably). The registry is global for now;
+/// it is not yet scoped per session.
 pub(crate) async fn index(
     state: &AppState,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<IndexRequest>(params)?;
-    require_session(state, &req.session_id)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
     // NOTE: registry is global for now; session_id is validated but not yet session-scoped.
     let reg = state.registry.read().unwrap_or_else(|p| p.into_inner());
     let resp = reg.index()?;
@@ -96,14 +109,15 @@ pub(crate) async fn index(
 
 /// Handle `axp.describe`: return full detail for one capability by name.
 ///
-/// The session id is validated (unknown → `NOT_FOUND`) and the capability name
-/// is resolved from the global registry (unknown name → `NOT_FOUND`).
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably). The capability name is then
+/// resolved from the global registry (unknown name → `NOT_FOUND`).
 pub(crate) async fn describe(
     state: &AppState,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<DescribeRequest>(params)?;
-    require_session(state, &req.session_id)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
     // NOTE: registry is global for now; session_id is validated but not yet session-scoped.
     let reg = state.registry.read().unwrap_or_else(|p| p.into_inner());
     let detail = reg.describe(&req.name)?;
@@ -112,19 +126,24 @@ pub(crate) async fn describe(
 
 /// Handle `job.start`: start a new job in an existing session.
 ///
-/// Delegates to [`JobEngine::start`] after decoding the request; the engine
-/// performs all session/capability/cwd validation.
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably) BEFORE any engine delegation.
+/// On success, delegates to [`JobEngine::start`]; the engine performs all
+/// capability/cwd validation.
 pub(crate) async fn job_start(
     state: &AppState,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<JobStartRequest>(params)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
     let job_id = state.engine.start(&req).await?;
     to_value(&axp_proto::JobStartResponse { job_id })
 }
 
 /// Handle `job.status`: return the current status of a job.
 ///
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably) BEFORE any engine delegation.
 /// Delegates to [`JobEngine::status`]; returns `NOT_FOUND` if the job is
 /// unknown or not owned by the specified session.
 pub(crate) async fn job_status(
@@ -132,12 +151,15 @@ pub(crate) async fn job_status(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<JobStatusRequest>(params)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
     let resp = state.engine.status(&req)?;
     to_value(&resp)
 }
 
 /// Handle `job.cancel`: cancel a running job.
 ///
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably) BEFORE any engine delegation.
 /// Delegates to [`JobEngine::cancel`]; returns `NOT_FOUND` if the job is
 /// unknown or not owned by the specified session.  Returns `ok: false` (not an
 /// error) when the job has already finished.
@@ -146,6 +168,7 @@ pub(crate) async fn job_cancel(
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<JobCancelRequest>(params)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
     let resp = state.engine.cancel(&req)?;
     to_value(&resp)
 }
@@ -161,7 +184,7 @@ mod tests {
         AppState,
         jsonrpc::{
             INVALID_PARAMS, INVALID_REQUEST, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND,
-            NOT_FOUND,
+            NOT_FOUND, UNAUTHORIZED,
         },
         router::dispatch,
     };
@@ -178,9 +201,11 @@ mod tests {
         serde_json::to_value(&resp).expect("JsonRpcResponse must serialize")
     }
 
-    /// Open a session over a real tempdir and return `(state, session_id, _dir)`.
-    /// Keep `_dir` alive for the duration of the test so the path remains valid.
-    async fn open_session(state: &AppState, dir: &tempfile::TempDir) -> SessionId {
+    /// Open a session over a real tempdir and return `(session_id, cap_token)`.
+    /// Keep the caller's `dir` alive for the duration of the test so the path
+    /// remains valid. The returned `cap_token` is the credential every
+    /// authenticated call must present.
+    async fn open_session(state: &AppState, dir: &tempfile::TempDir) -> (SessionId, String) {
         let ws = dir.path().to_string_lossy().into_owned();
         let v = call(
             state,
@@ -196,7 +221,11 @@ mod tests {
             .as_str()
             .expect("session_id must be a string")
             .to_owned();
-        SessionId(id_str)
+        let token = v["result"]["cap_token"]
+            .as_str()
+            .expect("cap_token must be a string")
+            .to_owned();
+        (SessionId(id_str), token)
     }
 
     // ── session.open ──────────────────────────────────────────────────────────
@@ -226,9 +255,14 @@ mod tests {
     async fn index_valid_session_returns_builtin_entries() {
         let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let sid = open_session(&state, &dir).await;
+        let (sid, token) = open_session(&state, &dir).await;
 
-        let v = call(&state, "axp.index", json!({ "session_id": sid.0 })).await;
+        let v = call(
+            &state,
+            "axp.index",
+            json!({ "session_id": sid.0, "cap_token": token }),
+        )
+        .await;
         let entries = v["result"]["entries"]
             .as_array()
             .expect("entries must be an array");
@@ -245,12 +279,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_unknown_session_returns_not_found() {
+    async fn index_unknown_session_returns_unauthorized() {
+        // Unknown session at an authenticated endpoint is deliberately
+        // indistinguishable from a bad token: both yield UNAUTHORIZED (no
+        // existence oracle).
         let state = AppState::new();
-        let v = call(&state, "axp.index", json!({ "session_id": "s_unknown" })).await;
+        let v = call(
+            &state,
+            "axp.index",
+            json!({ "session_id": "s_unknown", "cap_token": "ct_whatever" }),
+        )
+        .await;
         assert_eq!(
-            v["error"]["code"], NOT_FOUND,
-            "expected NOT_FOUND for unknown session: {v}"
+            v["error"]["code"], UNAUTHORIZED,
+            "expected UNAUTHORIZED for unknown session: {v}"
         );
     }
 
@@ -260,12 +302,12 @@ mod tests {
     async fn describe_unknown_capability_returns_not_found() {
         let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let sid = open_session(&state, &dir).await;
+        let (sid, token) = open_session(&state, &dir).await;
 
         let v = call(
             &state,
             "axp.describe",
-            json!({ "session_id": sid.0, "name": "nonexistent_cap" }),
+            json!({ "session_id": sid.0, "cap_token": token, "name": "nonexistent_cap" }),
         )
         .await;
         assert_eq!(
@@ -281,13 +323,14 @@ mod tests {
     async fn job_start_returns_job_id() {
         let state = AppState::new();
         let dir = tempfile::tempdir().expect("tempdir");
-        let sid = open_session(&state, &dir).await;
+        let (sid, token) = open_session(&state, &dir).await;
 
         let v = call(
             &state,
             "job.start",
             json!({
                 "session_id": sid.0,
+                "cap_token": token,
                 "kind": "command",
                 "command": "echo hi"
             }),

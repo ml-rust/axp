@@ -15,7 +15,7 @@ mod state;
 pub use error::TransportError;
 pub use jsonrpc::{
     DENIED, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST, JsonRpcError, JsonRpcRequest,
-    JsonRpcResponse, METHOD_NOT_FOUND, NOT_FOUND, NOT_IMPLEMENTED, PARSE_ERROR,
+    JsonRpcResponse, METHOD_NOT_FOUND, NOT_FOUND, NOT_IMPLEMENTED, PARSE_ERROR, UNAUTHORIZED,
 };
 pub use router::{build_router, dispatch, serve};
 pub use state::AppState;
