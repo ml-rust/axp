@@ -1,4 +1,4 @@
-//! H0-U7e — real-HTTP end-to-end integration test for `axp-transport`.
+//! Real-HTTP end-to-end integration test for `axp-transport`.
 //!
 //! Boots the AXP server on an ephemeral TCP port, then drives the full
 //! session.open → job.start → job.status (poll to terminal) → job/attach (SSE,
