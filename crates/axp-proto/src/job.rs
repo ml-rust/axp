@@ -120,6 +120,22 @@ pub struct JobStatusResponse {
     pub seq: u64,
 }
 
+/// `job.cancel` request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCancelRequest {
+    /// The session the caller is operating within (must own the job).
+    pub session_id: SessionId,
+    /// The job to cancel.
+    pub job_id: JobId,
+}
+
+/// `job.cancel` response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobCancelResponse {
+    /// True if a running job was signalled; false if it was already finished.
+    pub ok: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +305,33 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         let resp2: JobStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, resp2);
+    }
+
+    #[test]
+    fn job_cancel_request_round_trips() {
+        let req = JobCancelRequest {
+            session_id: SessionId("s_1".into()),
+            job_id: JobId("j_1".into()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let req2: JobCancelRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, req2);
+    }
+
+    #[test]
+    fn job_cancel_response_ok_true_round_trips() {
+        let resp = JobCancelResponse { ok: true };
+        let json = serde_json::to_string(&resp).unwrap();
+        let resp2: JobCancelResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, resp2);
+    }
+
+    #[test]
+    fn job_cancel_response_ok_false_round_trips() {
+        let resp = JobCancelResponse { ok: false };
+        let json = serde_json::to_string(&resp).unwrap();
+        let resp2: JobCancelResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, resp2);
     }
 }
