@@ -137,8 +137,10 @@ dependencies = [
 name = "axp-core"
 version = "0.0.0"
 dependencies = [
+ "axp-codemode",
  "axp-proto",
  "axp-sandbox",
+ "base64",
  "bytes",
  "getrandom 0.2.17",
  "serde_json",

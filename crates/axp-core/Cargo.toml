@@ -9,10 +9,12 @@ authors.workspace = true
 
 [dependencies]
 axp-proto = { workspace = true }
+axp-codemode = { workspace = true }
 axp-sandbox = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }
+base64 = { workspace = true }
 tokio = { workspace = true }
 getrandom = { workspace = true }
 

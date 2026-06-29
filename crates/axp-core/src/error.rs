@@ -40,6 +40,13 @@ pub enum Error {
         name: String,
     },
 
+    /// A code-mode payload was rejected before job creation.
+    #[error("invalid code payload: {reason}")]
+    InvalidCodePayload {
+        /// Human-readable reason for the rejection.
+        reason: String,
+    },
+
     /// A provider registration was rejected because a provider with that id already exists.
     #[error("duplicate provider: `{id}`")]
     DuplicateProvider {

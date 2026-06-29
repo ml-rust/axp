@@ -31,6 +31,8 @@ use std::sync::{
 };
 use std::time::SystemTime;
 
+use axp_codemode::CodeModeRunner;
+use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
 use tokio::sync::oneshot;
@@ -165,12 +167,13 @@ impl JobEngine {
         }
     }
 
-    /// Start a job: validate, spawn the child process, and launch the drainer.
+    /// Start a job: validate, spawn the work, and launch its completion task.
     ///
     /// All synchronous validation (session lookup, capability checks, cwd
     /// resolution, job-level attenuation) happens BEFORE the process is spawned.
-    /// A [`Job`] is created only after a successful spawn — a job exists iff it
-    /// started.  The actual draining/reaping runs on a detached tokio task.
+    /// A [`Job`] is created only after work has enough validated state to run —
+    /// a job exists iff it started. The actual completion runs on a detached
+    /// tokio task.
     ///
     /// # Errors
     ///
@@ -178,7 +181,8 @@ impl JobEngine {
     /// - [`Error::CapabilityDenied`] if the session lacks `proc.spawn` for a
     ///   command payload, lacks `tool:<name>` (or `proc.spawn`) for a capability
     ///   payload, or lacks any requested job-level capability.
-    /// - [`Error::NotImplemented`] for code-mode payloads (not yet supported).
+    /// - [`Error::InvalidCodePayload`] if a code-mode payload has an unsupported
+    ///   language or invalid base64.
     /// - [`Error::CapabilityNotFound`] if a capability payload names an unknown
     ///   capability.
     /// - [`Error::WorkspaceViolation`] if `cwd` resolves outside the workspace.
@@ -208,8 +212,15 @@ impl JobEngine {
                 }
                 Runnable::Shell(command)
             }
-            JobPayload::Code { .. } => {
-                return Err(Error::NotImplemented("code-mode execution"));
+            JobPayload::Code { code, lang } => {
+                let bytes = decode_code_payload(code, lang)?;
+
+                // Resolve cwd and job-level capability attenuation before creating
+                // a job, matching the command/capability validation ordering.
+                let cwd = resolve_cwd(req.cwd.as_deref(), &workspace)?;
+                self.validate_job_capabilities(&req.capabilities, &capabilities)?;
+
+                return self.start_code_job(req, cwd, bytes).await;
             }
             JobPayload::Capability { name, params } => {
                 // A capability invocation requires the narrow `tool:<name>` grant OR
@@ -238,14 +249,7 @@ impl JobEngine {
 
         // 4. Job-level capability attenuation: every requested capability must be
         //    permitted by the session's grants.
-        for wire_cap in &req.capabilities {
-            let rc = RuntimeCapability::parse(wire_cap)?;
-            if !capabilities.permits(&rc) {
-                return Err(Error::CapabilityDenied {
-                    required: wire_cap.0.clone(),
-                });
-            }
-        }
+        self.validate_job_capabilities(&req.capabilities, &capabilities)?;
 
         // 5. Build the command. Shell payloads run via `sh -c`; capability payloads
         //    run as a resolved argv (no shell), which is shell-injection-safe.
@@ -287,12 +291,7 @@ impl JobEngine {
         })?;
 
         // 8. Create the job in the Running state and insert it.
-        let id = self.next_job_id();
-        let mut job = Job::new(id.clone(), req.session_id.clone(), req.payload.clone(), cwd);
-        job.log_buffer = LogBuffer::with_cap(self.log_byte_cap);
-        job.status = JobStatus::Running;
-        job.started_at = Some(SystemTime::now());
-        let handle = self.jobs.insert(job);
+        let (id, handle) = self.insert_running_job(req, cwd);
 
         // 9. Register the cancellation channel.
         let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -323,6 +322,126 @@ impl JobEngine {
 
         // 12. Return the new job id.
         Ok(id)
+    }
+
+    fn validate_job_capabilities(
+        &self,
+        requested: &[axp_proto::Capability],
+        capabilities: &CapabilitySet,
+    ) -> Result<()> {
+        for wire_cap in requested {
+            let rc = RuntimeCapability::parse(wire_cap)?;
+            if !capabilities.permits(&rc) {
+                return Err(Error::CapabilityDenied {
+                    required: wire_cap.0.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_running_job(
+        &self,
+        req: &JobStartRequest,
+        cwd: std::path::PathBuf,
+    ) -> (JobId, Arc<RwLock<Job>>) {
+        let id = self.next_job_id();
+        let mut job = Job::new(id.clone(), req.session_id.clone(), req.payload.clone(), cwd);
+        job.log_buffer = LogBuffer::with_cap(self.log_byte_cap);
+        job.status = JobStatus::Running;
+        job.started_at = Some(SystemTime::now());
+        let handle = self.jobs.insert(job);
+        (id, handle)
+    }
+
+    async fn start_code_job(
+        &self,
+        req: &JobStartRequest,
+        cwd: std::path::PathBuf,
+        bytes: Vec<u8>,
+    ) -> Result<JobId> {
+        let (id, handle) = self.insert_running_job(req, cwd);
+
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        self.cancels().insert(id.clone(), cancel_tx);
+
+        self.record_session_audit(
+            &req.session_id,
+            AuditEventKind::JobStarted { job_id: id.clone() },
+        );
+
+        let engine = self.clone();
+        let task = JobTask {
+            job_id: id.clone(),
+            session_id: req.session_id.clone(),
+            handle,
+        };
+        tokio::spawn(async move {
+            engine.run_code_to_completion(task, bytes, cancel_rx).await;
+        });
+
+        Ok(id)
+    }
+
+    async fn run_code_to_completion(
+        &self,
+        task: JobTask,
+        bytes: Vec<u8>,
+        mut cancel_rx: oneshot::Receiver<()>,
+    ) {
+        let JobTask {
+            job_id,
+            session_id,
+            handle,
+        } = task;
+
+        let run = tokio::task::spawn_blocking(move || {
+            CodeModeRunner::new()
+                .and_then(|runner| runner.run_component(&bytes))
+                .map_err(|e| e.to_string())
+        });
+
+        let final_status = tokio::select! {
+            biased;
+
+            res = (&mut cancel_rx) => {
+                let _ = res;
+                JobStatus::Killed
+            }
+
+            joined = run => {
+                match joined {
+                    Ok(Ok(output)) => {
+                        match output.result {
+                            Some(result) => match self.push_text_result(
+                                &handle,
+                                LogStream::Stdout,
+                                &result,
+                            ) {
+                                Ok(()) => JobStatus::Exited { code: 0 },
+                                Err(e) => JobStatus::Failed {
+                                    reason: e.to_string(),
+                                },
+                            },
+                            None => {
+                                JobStatus::Exited { code: 0 }
+                            }
+                        }
+                    }
+                    Ok(Err(reason)) => {
+                        let _ = self.push_text_result(&handle, LogStream::Stderr, &reason);
+                        JobStatus::Failed { reason }
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        let _ = self.push_text_result(&handle, LogStream::Stderr, &reason);
+                        JobStatus::Failed { reason }
+                    }
+                }
+            }
+        };
+
+        self.finish_job(job_id, session_id, handle, final_status);
     }
 
     /// Drive a spawned job to completion: drain its output, honour cancellation,
@@ -427,12 +546,50 @@ impl JobEngine {
             }
         };
 
+        self.finish_job(job_id, session_id, handle, final_status);
+    }
+
+    /// Push a chunk of output into a job's log buffer.
+    ///
+    /// The write lock is acquired and dropped entirely within this synchronous
+    /// function — there is no `.await` inside — so the locking discipline holds.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`Error::LogBufferOverflow`] from the underlying buffer.
+    fn push_log(&self, handle: &Arc<RwLock<Job>>, stream: LogStream, bytes: &[u8]) -> Result<()> {
+        let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
+        job.log_buffer
+            .push(stream, Bytes::copy_from_slice(bytes), SystemTime::now())?;
+        Ok(())
+    }
+
+    fn push_text_result(
+        &self,
+        handle: &Arc<RwLock<Job>>,
+        stream: LogStream,
+        text: &str,
+    ) -> Result<()> {
+        let mut bytes = text.as_bytes().to_vec();
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        self.push_log(handle, stream, &bytes)
+    }
+
+    fn finish_job(
+        &self,
+        job_id: JobId,
+        session_id: SessionId,
+        handle: Arc<RwLock<Job>>,
+        final_status: JobStatus,
+    ) {
         // Write the terminal state under a short lock with no await inside.
-        // The drainer's final state write does NOT push a log event, so it would
-        // not otherwise wake live subscribers. Capture the buffer's notify and
-        // fire it AFTER the terminal status is written so any `JobLogStream`
-        // waiting on a quiet-then-finished job observes the terminal state and
-        // returns `None` instead of hanging forever.
+        // The final state write does NOT push a log event, so it would not
+        // otherwise wake live subscribers. Capture the buffer's notify and fire
+        // it AFTER the terminal status is written so any `JobLogStream` waiting
+        // on a quiet-then-finished job observes the terminal state and returns
+        // `None` instead of hanging forever.
         let notify = {
             let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
             job.status = final_status.clone();
@@ -453,21 +610,6 @@ impl JobEngine {
 
         // Drop the cancellation sender; the job is finished.
         self.cancels().remove(&job_id);
-    }
-
-    /// Push a chunk of output into a job's log buffer.
-    ///
-    /// The write lock is acquired and dropped entirely within this synchronous
-    /// function — there is no `.await` inside — so the locking discipline holds.
-    ///
-    /// # Errors
-    ///
-    /// Propagates [`Error::LogBufferOverflow`] from the underlying buffer.
-    fn push_log(&self, handle: &Arc<RwLock<Job>>, stream: LogStream, bytes: &[u8]) -> Result<()> {
-        let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
-        job.log_buffer
-            .push(stream, Bytes::copy_from_slice(bytes), SystemTime::now())?;
-        Ok(())
     }
 
     /// Send the cancellation signal for a job (best-effort SIGKILL via the drainer).
@@ -710,6 +852,23 @@ where
     }
 }
 
+fn decode_code_payload(code: &str, lang: &Option<String>) -> Result<Vec<u8>> {
+    match lang {
+        Some(lang) if lang != "wasm-component" => {
+            return Err(Error::InvalidCodePayload {
+                reason: format!("unsupported language `{lang}`"),
+            });
+        }
+        Some(_) | None => {}
+    }
+
+    general_purpose::STANDARD
+        .decode(code)
+        .map_err(|e| Error::InvalidCodePayload {
+            reason: format!("invalid base64: {e}"),
+        })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -775,6 +934,24 @@ mod tests {
             payload: JobPayload::Command {
                 command: command.into(),
             },
+            cwd: None,
+            capabilities: vec![],
+        }
+    }
+
+    const NOOP_COMPONENT: &str = r#"
+        (component
+          (core module $m
+            (func (export "run")))
+          (core instance $i (instantiate $m))
+          (func (export "run") (canon lift (core func $i "run"))))
+    "#;
+
+    fn code_req(session_id: &SessionId, code: String, lang: Option<String>) -> JobStartRequest {
+        JobStartRequest {
+            session_id: session_id.clone(),
+            cap_token: "ct_test".into(),
+            payload: JobPayload::Code { code, lang },
             cwd: None,
             capabilities: vec![],
         }
@@ -877,23 +1054,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn code_payload_not_implemented() {
-        let h = harness();
-        let req = JobStartRequest {
-            session_id: h.session_id.clone(),
-            cap_token: "ct_test".into(),
-            payload: JobPayload::Code {
-                code: "x".into(),
-                lang: None,
-            },
-            cwd: None,
-            capabilities: vec![],
-        };
+    async fn code_payload_runs_without_proc_spawn() {
+        let h = harness_with(CapabilitySet::default());
+        let req = code_req(
+            &h.session_id,
+            general_purpose::STANDARD.encode(NOOP_COMPONENT),
+            None,
+        );
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert_eq!(status, JobStatus::Exited { code: 0 });
+    }
+
+    #[tokio::test]
+    async fn code_payload_invalid_base64_is_rejected_without_job() {
+        let h = harness_with(CapabilitySet::default());
+        let req = code_req(&h.session_id, "not base64!".into(), None);
         let result = h.engine.start(&req).await;
         assert!(
-            matches!(result, Err(Error::NotImplemented(_))),
-            "expected NotImplemented, got {result:?}"
+            matches!(result, Err(Error::InvalidCodePayload { .. })),
+            "expected InvalidCodePayload, got {result:?}"
         );
+        assert!(
+            h.engine.jobs().get(&JobId("j_1".into())).is_none(),
+            "no job should exist after invalid code payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_payload_unknown_lang_is_rejected() {
+        let h = harness_with(CapabilitySet::default());
+        let req = code_req(
+            &h.session_id,
+            general_purpose::STANDARD.encode(NOOP_COMPONENT),
+            Some("python".into()),
+        );
+        let result = h.engine.start(&req).await;
+        assert!(
+            matches!(result, Err(Error::InvalidCodePayload { .. })),
+            "expected InvalidCodePayload, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_payload_runner_failure_marks_failed() {
+        let h = harness_with(CapabilitySet::default());
+        let req = code_req(
+            &h.session_id,
+            general_purpose::STANDARD.encode("not a component"),
+            Some("wasm-component".into()),
+        );
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert!(
+            matches!(status, JobStatus::Failed { .. }),
+            "expected Failed, got {status:?}"
+        );
+        let err = collected_bytes(&h.engine, &id, LogStream::Stderr);
+        assert!(!err.is_empty(), "stderr should contain the runner error");
     }
 
     // ── capability invocation ────────────────────────────────────────────────
