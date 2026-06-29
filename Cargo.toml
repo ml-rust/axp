@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 tempfile = "3"
 bytes = "1"
 getrandom = "0.2"
+wasmtime = { version = "34.0.2", default-features = false, features = ["runtime", "cranelift", "component-model", "wat"] }
 landlock = "0.4"
 seccompiler = "0.5"
 libc = "0.2"
@@ -33,6 +34,7 @@ axp-proto = { path = "crates/axp-proto", version = "0.0.0" }
 axp-core = { path = "crates/axp-core", version = "0.0.0" }
 axp-sandbox = { path = "crates/axp-sandbox", version = "0.0.0" }
 axp-transport = { path = "crates/axp-transport", version = "0.0.0" }
+axp-codemode = { path = "crates/axp-codemode", version = "0.0.0" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

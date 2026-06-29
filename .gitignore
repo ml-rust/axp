@@ -12,4 +12,5 @@ research/
 .DS_Store
 
 # session prep scratch (never committed)
+.agents/prep/
 .claude/prep/
