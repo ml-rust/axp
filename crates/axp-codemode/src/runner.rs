@@ -1,5 +1,10 @@
 //! WASM Component Model runner.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use wasmtime::{
     Config, Engine, Store, StoreContextMut,
     component::{Component, Linker},
@@ -12,6 +17,9 @@ pub const DEFAULT_ENTRYPOINT: &str = "run";
 
 /// Default fuel budget charged to a component execution.
 pub const DEFAULT_FUEL: u64 = 10_000_000;
+
+/// Default epoch delta before an interrupt traps component execution.
+pub const DEFAULT_EPOCH_DEADLINE: u64 = 1;
 
 /// Default root import name for a host-provided string result.
 pub const DEFAULT_HOST_RESULT_IMPORT: &str = "host-result";
@@ -53,6 +61,23 @@ impl Default for RunnerConfig {
     }
 }
 
+/// Thread-safe handle that interrupts code-mode execution for one runner.
+#[derive(Debug, Clone)]
+pub struct CodeModeInterruptHandle {
+    engine: Engine,
+    interrupted: Arc<AtomicBool>,
+}
+
+impl CodeModeInterruptHandle {
+    /// Request interruption of stores using this runner's engine.
+    ///
+    /// The next epoch check in a store whose deadline has been armed will trap.
+    pub fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::Release);
+        self.engine.increment_epoch();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CodeModeStore {
     host_result: String,
@@ -84,9 +109,18 @@ impl CodeModeRunner {
         let mut wasmtime_config = Config::new();
         wasmtime_config.wasm_component_model(true);
         wasmtime_config.consume_fuel(true);
+        wasmtime_config.epoch_interruption(true);
 
         let engine = Engine::new(&wasmtime_config).map_err(Error::Engine)?;
         Ok(Self { engine, config })
+    }
+
+    /// Return a handle that can interrupt component execution from another thread.
+    pub fn interrupt_handle(&self) -> CodeModeInterruptHandle {
+        CodeModeInterruptHandle {
+            engine: self.engine.clone(),
+            interrupted: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Compile, instantiate, and call the configured component entrypoint.
@@ -99,6 +133,28 @@ impl CodeModeRunner {
     /// Returns an error if the component fails to compile or instantiate, if the
     /// entrypoint is missing or has the wrong type, or if execution traps.
     pub fn run_component(&self, bytes: &[u8]) -> Result<RunOutput> {
+        self.run_component_with_interrupt(bytes, &self.interrupt_handle())
+    }
+
+    /// Compile, instantiate, and call the configured entrypoint with cancellation.
+    ///
+    /// The interrupt handle must come from this runner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component fails to compile or instantiate, if the
+    /// entrypoint is missing or has the wrong type, or if execution traps.
+    pub fn run_component_with_interrupt(
+        &self,
+        bytes: &[u8],
+        interrupt: &CodeModeInterruptHandle,
+    ) -> Result<RunOutput> {
+        if !Engine::same(&self.engine, &interrupt.engine) {
+            return Err(Error::Run(wasmtime::Error::msg(
+                "interrupt handle belongs to a different code-mode runner",
+            )));
+        }
+
         let component = Component::new(&self.engine, bytes).map_err(Error::Compile)?;
         let mut linker = Linker::new(&self.engine);
         let returns_host_result = self.config.host_imports.host_result.is_some();
@@ -126,6 +182,11 @@ impl CodeModeRunner {
             },
         );
         store.set_fuel(self.config.fuel).map_err(Error::Fuel)?;
+        store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+        store.epoch_deadline_trap();
+        if interrupt.interrupted.load(Ordering::Acquire) {
+            store.set_epoch_deadline(0);
+        }
 
         let instance = linker
             .instantiate(&mut store, &component)
@@ -291,5 +352,25 @@ mod tests {
             .expect_err("loop should exhaust fuel");
 
         assert!(matches!(err, Error::Run(_)));
+    }
+
+    #[test]
+    fn interrupt_handle_stops_looping_component() {
+        let runner = CodeModeRunner::with_config(RunnerConfig {
+            fuel: u64::MAX,
+            ..RunnerConfig::default()
+        })
+        .expect("runner config");
+        let interrupt = runner.interrupt_handle();
+        let run_interrupt = interrupt.clone();
+
+        let run = std::thread::spawn(move || {
+            runner.run_component_with_interrupt(LOOP_COMPONENT.as_bytes(), &run_interrupt)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        interrupt.interrupt();
+
+        let result = run.join().expect("runner thread");
+        assert!(matches!(result, Err(Error::Run(_))));
     }
 }

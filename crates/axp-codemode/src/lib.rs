@@ -8,6 +8,6 @@ mod runner;
 
 pub use error::{Error, Result};
 pub use runner::{
-    CodeModeRunner, DEFAULT_ENTRYPOINT, DEFAULT_FUEL, DEFAULT_HOST_RESULT_IMPORT, HostImports,
-    RunOutput, RunnerConfig,
+    CodeModeInterruptHandle, CodeModeRunner, DEFAULT_ENTRYPOINT, DEFAULT_EPOCH_DEADLINE,
+    DEFAULT_FUEL, DEFAULT_HOST_RESULT_IMPORT, HostImports, RunOutput, RunnerConfig,
 };

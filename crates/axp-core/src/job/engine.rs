@@ -31,7 +31,7 @@ use std::sync::{
 };
 use std::time::SystemTime;
 
-use axp_codemode::CodeModeRunner;
+use axp_codemode::{CodeModeInterruptHandle, CodeModeRunner};
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
@@ -67,6 +67,11 @@ struct JobTask {
     handle: Arc<RwLock<Job>>,
 }
 
+struct CancelEntry {
+    signal: oneshot::Sender<()>,
+    code_interrupt: Option<CodeModeInterruptHandle>,
+}
+
 /// What a job actually runs: either a user shell string or a resolved capability argv.
 ///
 /// Both variants flow through one uniform command-build path in [`JobEngine::start`];
@@ -90,7 +95,7 @@ pub struct JobEngine {
     sessions: SessionStore,
     jobs: JobStore,
     next_id: Arc<AtomicU64>,
-    cancels: Arc<Mutex<HashMap<JobId, oneshot::Sender<()>>>>,
+    cancels: Arc<Mutex<HashMap<JobId, CancelEntry>>>,
     /// Per-job log-buffer byte cap. A job whose output exceeds this is killed and
     /// marked `Failed` (output is never silently dropped).
     log_byte_cap: usize,
@@ -149,7 +154,7 @@ impl JobEngine {
     /// The guard is held only briefly to insert/remove/send a `oneshot` sender;
     /// no `.await` ever happens while it is held, so poison recovery cannot expose
     /// a logically broken state.
-    fn cancels(&self) -> std::sync::MutexGuard<'_, HashMap<JobId, oneshot::Sender<()>>> {
+    fn cancels(&self) -> std::sync::MutexGuard<'_, HashMap<JobId, CancelEntry>> {
         self.cancels.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -295,7 +300,13 @@ impl JobEngine {
 
         // 9. Register the cancellation channel.
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.cancels().insert(id.clone(), cancel_tx);
+        self.cancels().insert(
+            id.clone(),
+            CancelEntry {
+                signal: cancel_tx,
+                code_interrupt: None,
+            },
+        );
 
         // 9a. Record the JobStarted audit event now that the job truly exists.
         self.record_session_audit(
@@ -360,10 +371,20 @@ impl JobEngine {
         cwd: std::path::PathBuf,
         bytes: Vec<u8>,
     ) -> Result<JobId> {
+        let runner = CodeModeRunner::new().map_err(|e| Error::JobSpawn {
+            reason: e.to_string(),
+        })?;
+        let interrupt = runner.interrupt_handle();
         let (id, handle) = self.insert_running_job(req, cwd);
 
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        self.cancels().insert(id.clone(), cancel_tx);
+        self.cancels().insert(
+            id.clone(),
+            CancelEntry {
+                signal: cancel_tx,
+                code_interrupt: Some(interrupt.clone()),
+            },
+        );
 
         self.record_session_audit(
             &req.session_id,
@@ -377,7 +398,9 @@ impl JobEngine {
             handle,
         };
         tokio::spawn(async move {
-            engine.run_code_to_completion(task, bytes, cancel_rx).await;
+            engine
+                .run_code_to_completion(task, runner, interrupt, bytes, cancel_rx)
+                .await;
         });
 
         Ok(id)
@@ -386,6 +409,8 @@ impl JobEngine {
     async fn run_code_to_completion(
         &self,
         task: JobTask,
+        runner: CodeModeRunner,
+        interrupt: CodeModeInterruptHandle,
         bytes: Vec<u8>,
         mut cancel_rx: oneshot::Receiver<()>,
     ) {
@@ -395,9 +420,10 @@ impl JobEngine {
             handle,
         } = task;
 
-        let run = tokio::task::spawn_blocking(move || {
-            CodeModeRunner::new()
-                .and_then(|runner| runner.run_component(&bytes))
+        let run_interrupt = interrupt.clone();
+        let mut run = tokio::task::spawn_blocking(move || {
+            runner
+                .run_component_with_interrupt(&bytes, &run_interrupt)
                 .map_err(|e| e.to_string())
         });
 
@@ -406,10 +432,12 @@ impl JobEngine {
 
             res = (&mut cancel_rx) => {
                 let _ = res;
+                interrupt.interrupt();
+                let _ = run.await;
                 JobStatus::Killed
             }
 
-            joined = run => {
+            joined = &mut run => {
                 match joined {
                     Ok(Ok(output)) => {
                         match output.result {
@@ -615,15 +643,17 @@ impl JobEngine {
     /// Send the cancellation signal for a job (best-effort SIGKILL via the drainer).
     ///
     /// Returns `Err(JobNotFound)` if the job's cancel sender is absent — i.e. the
-    /// job is unknown to the cancel table (either it never existed, or it already
-    /// finished and the drainer removed the sender).
+    /// job is unknown to the cancel table, already signalled, or already finished.
     ///
     /// This is a private helper; callers must perform ownership checks before
     /// invoking it.
     fn kill_job(&self, job_id: &JobId) -> Result<()> {
         match self.cancels().remove(job_id) {
-            Some(tx) => {
-                let _ = tx.send(());
+            Some(entry) => {
+                let _ = entry.signal.send(());
+                if let Some(interrupt) = entry.code_interrupt {
+                    interrupt.interrupt();
+                }
                 Ok(())
             }
             None => Err(Error::JobNotFound(job_id.clone())),
@@ -633,7 +663,7 @@ impl JobEngine {
     /// Cancel a running job the caller owns (best-effort SIGKILL via the drainer).
     ///
     /// Returns `ok: true` if a running job was signalled, `ok: false` if the job
-    /// exists and is owned by the caller but already finished (nothing to cancel).
+    /// exists and is owned by the caller but is already signalled or finished.
     ///
     /// # Errors
     ///
@@ -643,7 +673,7 @@ impl JobEngine {
         self.lookup_owned(&req.session_id, &req.job_id)?;
         match self.kill_job(&req.job_id) {
             Ok(()) => Ok(JobCancelResponse { ok: true }),
-            // Already finished (drainer removed the sender) — owned but done.
+            // Already signalled or finished — owned, but nothing new to cancel.
             Err(Error::JobNotFound(_)) => Ok(JobCancelResponse { ok: false }),
             Err(e) => Err(e),
         }
@@ -947,6 +977,16 @@ mod tests {
           (func (export "run") (canon lift (core func $i "run"))))
     "#;
 
+    const LOOP_COMPONENT: &str = r#"
+        (component
+          (core module $m
+            (func $run (export "run")
+              (loop $again
+                br $again)))
+          (core instance $i (instantiate $m))
+          (func (export "run") (canon lift (core func $i "run"))))
+    "#;
+
     fn code_req(session_id: &SessionId, code: String, lang: Option<String>) -> JobStartRequest {
         JobStartRequest {
             session_id: session_id.clone(),
@@ -1112,6 +1152,30 @@ mod tests {
         );
         let err = collected_bytes(&h.engine, &id, LogStream::Stderr);
         assert!(!err.is_empty(), "stderr should contain the runner error");
+    }
+
+    #[tokio::test]
+    async fn code_payload_cancel_loop_marks_killed() {
+        let h = harness_with(CapabilitySet::default());
+        let req = code_req(
+            &h.session_id,
+            general_purpose::STANDARD.encode(LOOP_COMPONENT),
+            Some("wasm-component".into()),
+        );
+        let id = h.engine.start(&req).await.expect("start");
+        let cancel_req = axp_proto::JobCancelRequest {
+            session_id: h.session_id.clone(),
+            cap_token: "ct_test".into(),
+            job_id: id.clone(),
+        };
+
+        let resp = h.engine.cancel(&cancel_req).expect("cancel");
+        assert!(
+            resp.ok,
+            "cancel should return ok=true for a running code job"
+        );
+        let status = poll_terminal(&h.engine, &id).await;
+        assert_eq!(status, JobStatus::Killed);
     }
 
     // ── capability invocation ────────────────────────────────────────────────
