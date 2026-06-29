@@ -36,6 +36,7 @@ axp-core = { path = "crates/axp-core", version = "0.0.0" }
 axp-sandbox = { path = "crates/axp-sandbox", version = "0.0.0" }
 axp-transport = { path = "crates/axp-transport", version = "0.0.0" }
 axp-codemode = { path = "crates/axp-codemode", version = "0.0.0" }
+axp-client = { path = "crates/axp-client", version = "0.0.0" }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

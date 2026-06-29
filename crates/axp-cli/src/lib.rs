@@ -2,6 +2,8 @@
 //!
 //! All logic lives here; `main.rs` is a one-liner that delegates to [`run`].
 
+mod demo;
+
 use clap::Parser;
 
 /// AXP — Agent Execution Protocol runtime.
@@ -17,6 +19,8 @@ pub struct Cli {
 pub enum Command {
     /// Run the AXP runtime as an HTTP (JSON-RPC + SSE) server.
     Serve(ServeArgs),
+    /// Run demos against an existing AXP runtime.
+    Demo(demo::DemoArgs),
 }
 
 /// Arguments for the `serve` subcommand.
@@ -51,6 +55,22 @@ pub fn run() -> std::process::ExitCode {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("server error: {e}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        Some(Command::Demo(args)) => {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("failed to start async runtime: {e}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            match rt.block_on(demo::run(args)) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("demo error: {e}");
                     std::process::ExitCode::FAILURE
                 }
             }

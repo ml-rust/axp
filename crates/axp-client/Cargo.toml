@@ -1,5 +1,5 @@
 [package]
-name = "axp-cli"
+name = "axp-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,18 +7,15 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
-[lib]
-# default: src/lib.rs
-
-[[bin]]
-name = "axp"
-path = "src/main.rs"
-
 [dependencies]
-axp-client = { workspace = true }
 axp-proto = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
 axp-transport = { workspace = true }
-clap = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 
