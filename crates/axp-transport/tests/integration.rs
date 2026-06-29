@@ -17,6 +17,12 @@ use axp_core::{
 /// Terminal `JobStatusProto` discriminant values; shared by the poll helpers.
 const TERMINAL_STATUSES: [&str; 3] = ["exited", "killed", "failed"];
 
+const NOOP_COMPONENT_BASE64: &str = "\
+    CiAgICAoY29tcG9uZW50CiAgICAgIChjb3JlIG1vZHVsZSAkbQogICAgICAgIChmdW5jIChl\
+    eHBvcnQgInJ1biIpKSkKICAgICAgKGNvcmUgaW5zdGFuY2UgJGkgKGluc3RhbnRpYXRlICRt\
+    KSkKICAgICAgKGZ1bmMgKGV4cG9ydCAicnVuIikgKGNhbm9uIGxpZnQgKGNvcmUgZnVuYyAk\
+    aSAicnVuIikpKSkK";
+
 // ── Shared helpers ─────────────────────────────────────────────────────────────
 
 /// Spawn the server with a caller-supplied AppState; returns the base URL.
@@ -455,6 +461,92 @@ async fn attach_resume_past_end_yields_no_frames() {
         collected_log_bytes(&body_hdr).is_empty(),
         "Last-Event-ID must override from_offset and suppress replay, got: {body_hdr}"
     );
+}
+
+// ── Test: code-mode WASM component runs over HTTP without proc.spawn ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn code_payload_wasm_component_runs_over_http_without_proc_spawn() {
+    let (base, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    let open = rpc(
+        &client,
+        &base,
+        "session.open",
+        serde_json::json!({
+            "workspace": workspace,
+            "sandbox_tier": "dev-none",
+            "capabilities": [],
+        }),
+    )
+    .await;
+    assert!(
+        open.get("error").is_none(),
+        "session.open returned error: {open}"
+    );
+    let sid = open["result"]["session_id"]
+        .as_str()
+        .expect("session_id string")
+        .to_owned();
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token string")
+        .to_owned();
+
+    let start = rpc(
+        &client,
+        &base,
+        "job.start",
+        serde_json::json!({
+            "session_id": sid,
+            "cap_token": token,
+            "kind": "code",
+            "lang": "wasm-component",
+            "code": NOOP_COMPONENT_BASE64,
+        }),
+    )
+    .await;
+    assert!(
+        start.get("error").is_none(),
+        "job.start returned error: {start}"
+    );
+    let jid = start["result"]["job_id"]
+        .as_str()
+        .expect("job_id string")
+        .to_owned();
+
+    for _ in 0..100 {
+        let status_resp = rpc(
+            &client,
+            &base,
+            "job.status",
+            serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
+        )
+        .await;
+        assert!(
+            status_resp.get("error").is_none(),
+            "job.status returned error: {status_resp}"
+        );
+        let discriminant = status_resp["result"]["status"]["status"]
+            .as_str()
+            .unwrap_or("");
+        if TERMINAL_STATUSES.contains(&discriminant) {
+            assert_eq!(
+                discriminant, "exited",
+                "expected exited, got: {status_resp}"
+            );
+            let exit_code = status_resp["result"]["status"]["code"]
+                .as_i64()
+                .expect("code must be integer");
+            assert_eq!(exit_code, 0, "expected exit code 0, got: {exit_code}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("code job {jid} did not reach a terminal state within the polling timeout");
 }
 
 // ── Test 3: unknown session → JSON-RPC UNAUTHORIZED (-32004) ──────────────────
