@@ -27,11 +27,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc, Mutex, RwLock,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use axp_codemode::{CodeModeInterruptHandle, CodeModeRunner};
+use axp_codemode::{
+    CapabilityInvokeHandler, CodeModeInterruptHandle, CodeModeRunner, RunnerConfig,
+};
 use base64::{Engine as _, engine::general_purpose};
 use bytes::Bytes;
 use tokio::io::AsyncReadExt;
@@ -70,6 +72,32 @@ struct JobTask {
 struct CancelEntry {
     signal: oneshot::Sender<()>,
     code_interrupt: Option<CodeModeInterruptHandle>,
+    host_capability_cancel: Option<Arc<HostCapabilityCancelState>>,
+}
+
+#[derive(Debug, Default)]
+struct HostCapabilityCancelState {
+    cancelled: AtomicBool,
+}
+
+struct CodeCapabilityContext {
+    registry: Arc<RwLock<ProviderRegistry>>,
+    capabilities: CapabilitySet,
+    workspace: Workspace,
+    tier: EnforcementTier,
+    cwd: std::path::PathBuf,
+    stdout_byte_cap: usize,
+    cancel: Arc<HostCapabilityCancelState>,
+}
+
+impl HostCapabilityCancelState {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
 }
 
 /// What a job actually runs: either a user shell string or a resolved capability argv.
@@ -225,7 +253,9 @@ impl JobEngine {
                 let cwd = resolve_cwd(req.cwd.as_deref(), &workspace)?;
                 self.validate_job_capabilities(&req.capabilities, &capabilities)?;
 
-                return self.start_code_job(req, cwd, bytes).await;
+                return self
+                    .start_code_job(req, cwd, bytes, capabilities, workspace, tier)
+                    .await;
             }
             JobPayload::Capability { name, params } => {
                 // A capability invocation requires the narrow `tool:<name>` grant OR
@@ -305,6 +335,7 @@ impl JobEngine {
             CancelEntry {
                 signal: cancel_tx,
                 code_interrupt: None,
+                host_capability_cancel: None,
             },
         );
 
@@ -370,8 +401,33 @@ impl JobEngine {
         req: &JobStartRequest,
         cwd: std::path::PathBuf,
         bytes: Vec<u8>,
+        capabilities: CapabilitySet,
+        workspace: Workspace,
+        tier: EnforcementTier,
     ) -> Result<JobId> {
-        let runner = CodeModeRunner::new().map_err(|e| Error::JobSpawn {
+        let registry = self.registry.clone();
+        let handler_cwd = cwd.clone();
+        let stdout_byte_cap = self.log_byte_cap;
+        let host_cancel = Arc::new(HostCapabilityCancelState::default());
+        let handler_cancel = host_cancel.clone();
+        let capability_context = CodeCapabilityContext {
+            registry,
+            capabilities,
+            workspace,
+            tier,
+            cwd: handler_cwd,
+            stdout_byte_cap,
+            cancel: handler_cancel,
+        };
+        let capability_invoke: CapabilityInvokeHandler = Arc::new(move |name, params_json| {
+            invoke_code_capability(&capability_context, name, params_json)
+                .map_err(|e| e.to_string())
+        });
+        let runner = CodeModeRunner::with_config(RunnerConfig {
+            capability_invoke: Some(capability_invoke),
+            ..RunnerConfig::default()
+        })
+        .map_err(|e| Error::JobSpawn {
             reason: e.to_string(),
         })?;
         let interrupt = runner.interrupt_handle();
@@ -383,6 +439,7 @@ impl JobEngine {
             CancelEntry {
                 signal: cancel_tx,
                 code_interrupt: Some(interrupt.clone()),
+                host_capability_cancel: Some(host_cancel),
             },
         );
 
@@ -654,6 +711,9 @@ impl JobEngine {
                 if let Some(interrupt) = entry.code_interrupt {
                     interrupt.interrupt();
                 }
+                if let Some(host_cancel) = entry.host_capability_cancel {
+                    host_cancel.cancel();
+                }
                 Ok(())
             }
             None => Err(Error::JobNotFound(job_id.clone())),
@@ -899,6 +959,172 @@ fn decode_code_payload(code: &str, lang: &Option<String>) -> Result<Vec<u8>> {
         })
 }
 
+fn invoke_code_capability(
+    context: &CodeCapabilityContext,
+    name: &str,
+    params_json: &str,
+) -> Result<String> {
+    let tool_grant = RuntimeCapability::Tool(name.to_owned());
+    if !context.capabilities.permits(&tool_grant)
+        && !context.capabilities.permits(&RuntimeCapability::ProcSpawn)
+    {
+        return Err(Error::CapabilityDenied {
+            required: format!("tool:{name}"),
+        });
+    }
+
+    let params = serde_json::from_str(params_json).map_err(|e| Error::CapabilityParse {
+        raw: params_json.to_owned(),
+        reason: format!("invalid params JSON: {e}"),
+    })?;
+
+    let resolved = {
+        let reg = context.registry.read().unwrap_or_else(|p| p.into_inner());
+        reg.resolve(name, &params)?
+    };
+
+    let mut policy = build_sandbox_policy(context.tier, &context.workspace, &context.capabilities);
+    policy.allow_proc_spawn = true;
+
+    run_resolved_command_sync(
+        resolved,
+        &context.cwd,
+        context.stdout_byte_cap,
+        policy,
+        &context.cancel,
+    )
+}
+
+fn run_resolved_command_sync(
+    resolved: ResolvedCommand,
+    cwd: &std::path::Path,
+    stdout_byte_cap: usize,
+    policy: SandboxPolicy,
+    cancel: &HostCapabilityCancelState,
+) -> Result<String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| Error::JobSpawn {
+            reason: format!("failed to build capability runtime: {e}"),
+        })?;
+
+    runtime.block_on(run_resolved_command(
+        resolved,
+        cwd,
+        stdout_byte_cap,
+        policy,
+        cancel,
+    ))
+}
+
+async fn run_resolved_command(
+    resolved: ResolvedCommand,
+    cwd: &std::path::Path,
+    stdout_byte_cap: usize,
+    policy: SandboxPolicy,
+    cancel: &HostCapabilityCancelState,
+) -> Result<String> {
+    if cancel.is_cancelled() {
+        return Err(Error::JobSpawn {
+            reason: "capability command cancelled".into(),
+        });
+    }
+
+    let mut cmd = tokio::process::Command::new(&resolved.program);
+    cmd.args(&resolved.args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    cmd.kill_on_drop(true);
+
+    policy.apply(&mut cmd).map_err(|e| match e {
+        SandboxError::Unavailable { .. } => Error::SandboxUnavailable { source: e },
+        _ => Error::SandboxApply { source: e },
+    })?;
+
+    let mut child = cmd.spawn().map_err(|e| Error::JobSpawn {
+        reason: e.to_string(),
+    })?;
+    let mut stdout = child.stdout.take().ok_or_else(|| Error::JobSpawn {
+        reason: "capability stdout pipe was not available".into(),
+    })?;
+
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; DRAIN_BUF_SIZE];
+    let mut stdout_done = false;
+    let mut killed = false;
+    let mut status = None;
+    let mut poll_cancel = tokio::time::interval(Duration::from_millis(10));
+
+    loop {
+        tokio::select! {
+            _ = poll_cancel.tick() => {
+                if !killed && cancel.is_cancelled() {
+                    killed = true;
+                    let _ = child.start_kill();
+                }
+
+                match child.try_wait() {
+                    Ok(Some(es)) => status = Some(es),
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = child.start_kill();
+                        return Err(Error::JobSpawn {
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+
+            n = stdout.read(&mut buf), if !stdout_done => {
+                match n {
+                    Ok(0) => stdout_done = true,
+                    Ok(n) => {
+                        if bytes.len().saturating_add(n) > stdout_byte_cap {
+                            let _ = child.start_kill();
+                            return Err(Error::LogBufferOverflow {
+                                cap: stdout_byte_cap,
+                            });
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                    }
+                    Err(e) => {
+                        let _ = child.start_kill();
+                        return Err(Error::JobSpawn {
+                            reason: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
+        if status.is_some() && stdout_done {
+            break;
+        }
+    }
+
+    let status = status.ok_or_else(|| Error::JobSpawn {
+        reason: "capability command status was not available".into(),
+    })?;
+    if killed || cancel.is_cancelled() {
+        return Err(Error::JobSpawn {
+            reason: "capability command cancelled".into(),
+        });
+    }
+    if !status.success() {
+        return Err(Error::JobSpawn {
+            reason: format!("capability command exited with {status}"),
+        });
+    }
+
+    String::from_utf8(bytes).map_err(|e| Error::JobSpawn {
+        reason: format!("capability stdout was not valid UTF-8: {e}"),
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -986,6 +1212,71 @@ mod tests {
           (core instance $i (instantiate $m))
           (func (export "run") (canon lift (core func $i "run"))))
     "#;
+
+    fn capability_invoke_component(name: &str, params_json: &str) -> String {
+        format!(
+            r#"
+        (component
+          (import "axp:capability/invoke"
+            (func $invoke (param "name" string) (param "params-json" string) (result string)))
+          (core module $memory
+            (memory (export "memory") 1)
+            (global $next (mut i32) (i32.const 256))
+            (data (i32.const 32) "{name}")
+            (data (i32.const 64) "{params_json}")
+            (func (export "cabi_realloc")
+              (param i32 i32 i32 i32)
+              (result i32)
+              (local $ptr i32)
+              global.get $next
+              local.set $ptr
+              global.get $next
+              local.get 3
+              i32.add
+              global.set $next
+              local.get $ptr))
+          (core instance $memory-instance (instantiate $memory))
+          (alias core export $memory-instance "memory" (core memory $memory-export))
+          (alias core export $memory-instance "cabi_realloc" (core func $realloc))
+          (core func $invoke-lowered
+            (canon lower
+              (func $invoke)
+              (memory $memory-export)
+              (realloc $realloc)
+              string-encoding=utf8))
+          (core instance $imports
+            (export "axp:capability/invoke" (func $invoke-lowered)))
+          (core instance $env
+            (export "memory" (memory $memory-export)))
+          (core module $m
+            (import "" "axp:capability/invoke"
+              (func $invoke-core (param i32 i32 i32 i32 i32)))
+            (import "env" "memory" (memory 1))
+            (func (export "run") (result i32)
+              i32.const 32
+              i32.const {name_len}
+              i32.const 64
+              i32.const {params_len}
+              i32.const 0
+              call $invoke-core
+              i32.const 0))
+          (core instance $i
+            (instantiate $m
+              (with "" (instance $imports))
+              (with "env" (instance $env))))
+          (alias core export $i "run" (core func $run))
+          (func (export "run")
+            (result string)
+            (canon lift
+              (core func $run)
+              (memory $memory-export)
+              (realloc $realloc)
+              string-encoding=utf8)))
+    "#,
+            name_len = name.len(),
+            params_len = params_json.len(),
+        )
+    }
 
     fn code_req(session_id: &SessionId, code: String, lang: Option<String>) -> JobStartRequest {
         JobStartRequest {
@@ -1227,6 +1518,50 @@ mod tests {
         }
     }
 
+    fn sleepy_capability_harness(caps: CapabilitySet) -> Harness {
+        use crate::{CapabilityArg, CapabilityDescriptor, ExecutionSpec, NativeProvider};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ws = Workspace::new(dir.path()).expect("workspace");
+        let sessions = SessionStore::new();
+        let session_id = SessionId("s_sleepy_cap".into());
+        sessions.open(
+            session_id.clone(),
+            ws,
+            EnforcementTier::DevNone,
+            caps,
+            fresh_token(),
+        );
+
+        let provider = NativeProvider::new(
+            "test",
+            vec![CapabilityDescriptor {
+                name: "sleepy".into(),
+                desc: "Sleep long enough for cancellation tests".into(),
+                signature: "sleepy(): string".into(),
+                schema: serde_json::json!({}),
+                exec: ExecutionSpec {
+                    program: "sleep".into(),
+                    args_template: vec![CapabilityArg::Literal("30".into())],
+                },
+            }],
+        )
+        .expect("native provider");
+        let mut registry = crate::ProviderRegistry::new();
+        registry.register(Box::new(provider)).expect("register");
+
+        let engine = JobEngine::new(
+            sessions,
+            JobStore::new(),
+            std::sync::Arc::new(std::sync::RwLock::new(registry)),
+        );
+        Harness {
+            engine,
+            session_id,
+            _dir: dir,
+        }
+    }
+
     fn capability_req(session_id: &SessionId, name: &str) -> JobStartRequest {
         JobStartRequest {
             session_id: session_id.clone(),
@@ -1238,6 +1573,99 @@ mod tests {
             cwd: None,
             capabilities: vec![],
         }
+    }
+
+    fn capability_code_req(
+        session_id: &SessionId,
+        name: &str,
+        params_json: &str,
+    ) -> JobStartRequest {
+        code_req(
+            session_id,
+            general_purpose::STANDARD.encode(capability_invoke_component(name, params_json)),
+            Some("wasm-component".into()),
+        )
+    }
+
+    #[tokio::test]
+    async fn code_payload_invokes_registered_capability_with_tool_grant() {
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "say_hi".into(),
+        )]));
+        let req = capability_code_req(&h.session_id, "say_hi", "{}");
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert_eq!(status, JobStatus::Exited { code: 0 });
+        let out = collected_bytes(&h.engine, &id, LogStream::Stdout);
+        assert!(
+            out.windows(2).any(|w| w == b"hi"),
+            "stdout must contain `hi`, got {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    #[tokio::test]
+    async fn code_payload_cancel_inside_host_capability_marks_killed() {
+        let h = sleepy_capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "sleepy".into(),
+        )]));
+        let req = capability_code_req(&h.session_id, "sleepy", "{}");
+        let id = h.engine.start(&req).await.expect("start");
+        let cancel_req = axp_proto::JobCancelRequest {
+            session_id: h.session_id.clone(),
+            cap_token: "ct_test".into(),
+            job_id: id.clone(),
+        };
+
+        let resp = h.engine.cancel(&cancel_req).expect("cancel");
+        assert!(
+            resp.ok,
+            "cancel should return ok=true for a running code job"
+        );
+        let status = poll_terminal(&h.engine, &id).await;
+        assert_eq!(status, JobStatus::Killed);
+    }
+
+    #[tokio::test]
+    async fn code_payload_capability_missing_grant_fails_job() {
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "other".into(),
+        )]));
+        let req = capability_code_req(&h.session_id, "say_hi", "{}");
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert!(
+            matches!(status, JobStatus::Failed { .. }),
+            "expected Failed without the tool grant, got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_payload_capability_malformed_params_json_fails_job() {
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "say_hi".into(),
+        )]));
+        let req = capability_code_req(&h.session_id, "say_hi", "{");
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert!(
+            matches!(status, JobStatus::Failed { .. }),
+            "expected Failed for malformed params JSON, got {status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn code_payload_capability_unknown_name_fails_job() {
+        let h = capability_harness(CapabilitySet::new(vec![RuntimeCapability::Tool(
+            "ghost".into(),
+        )]));
+        let req = capability_code_req(&h.session_id, "ghost", "{}");
+        let id = h.engine.start(&req).await.expect("start");
+        let status = poll_terminal(&h.engine, &id).await;
+        assert!(
+            matches!(status, JobStatus::Failed { .. }),
+            "expected Failed for unknown capability, got {status:?}"
+        );
     }
 
     #[tokio::test]
