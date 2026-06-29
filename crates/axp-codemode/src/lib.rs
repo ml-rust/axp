@@ -7,4 +7,7 @@ mod error;
 mod runner;
 
 pub use error::{Error, Result};
-pub use runner::{CodeModeRunner, DEFAULT_ENTRYPOINT, DEFAULT_FUEL, RunOutput, RunnerConfig};
+pub use runner::{
+    CodeModeRunner, DEFAULT_ENTRYPOINT, DEFAULT_FUEL, DEFAULT_HOST_RESULT_IMPORT, HostImports,
+    RunOutput, RunnerConfig,
+};

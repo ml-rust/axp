@@ -17,7 +17,7 @@ pub enum Error {
     #[error("failed to instantiate WASM component: {0}")]
     Instantiate(#[source] wasmtime::Error),
     /// The configured entrypoint was missing or had an incompatible signature.
-    #[error("WASM component entrypoint `{name}` is not callable as `func()`")]
+    #[error("WASM component entrypoint `{name}` is not callable with the configured signature")]
     Entrypoint {
         /// Entrypoint name requested by the runner configuration.
         name: String,
