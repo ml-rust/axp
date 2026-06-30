@@ -109,15 +109,71 @@ pub(crate) fn decode_http_error(body: &[u8]) -> Option<RpcError> {
 }
 
 pub(crate) fn parse_sse_frames(body: &[u8]) -> Result<Vec<LogEventFrame>> {
-    let text = String::from_utf8_lossy(body);
-    let mut frames = Vec::new();
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            let frame = serde_json::from_str::<LogEventFrame>(data.trim())?;
+    let mut decoder = SseFrameDecoder::default();
+    let mut frames = decoder.push(body)?;
+    frames.extend(decoder.finish()?);
+    Ok(frames)
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SseFrameDecoder {
+    pending: Vec<u8>,
+    current: Vec<u8>,
+}
+
+impl SseFrameDecoder {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Vec<LogEventFrame>> {
+        let mut frames = Vec::new();
+        self.pending.extend_from_slice(bytes);
+
+        while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {
+            let mut line = self.pending.drain(..=newline).collect::<Vec<u8>>();
+            line.pop();
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+
+            if line.is_empty() {
+                if !self.current.is_empty() {
+                    decode_sse_event(&self.current, &mut frames)?;
+                    self.current.clear();
+                }
+                continue;
+            }
+
+            self.current.extend_from_slice(&line);
+            self.current.push(b'\n');
+        }
+
+        Ok(frames)
+    }
+
+    pub(crate) fn finish(mut self) -> Result<Vec<LogEventFrame>> {
+        let mut frames = Vec::new();
+        if !self.pending.is_empty() {
+            self.current.extend_from_slice(&self.pending);
+        }
+        if !self.current.is_empty() {
+            decode_sse_event(&self.current, &mut frames)?;
+        }
+        Ok(frames)
+    }
+}
+
+fn decode_sse_event(event: &[u8], frames: &mut Vec<LogEventFrame>) -> Result<()> {
+    for line in event.split(|byte| *byte == b'\n') {
+        let line = if line.ends_with(b"\r") {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+
+        if let Some(data) = line.strip_prefix(b"data:") {
+            let frame = serde_json::from_slice::<LogEventFrame>(data)?;
             frames.push(frame);
         }
     }
-    Ok(frames)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -168,6 +224,33 @@ mod tests {
             serde_json::to_string(&frame).expect("json")
         );
         let frames = parse_sse_frames(body.as_bytes()).expect("frames");
+        assert_eq!(frames, vec![frame]);
+    }
+
+    #[test]
+    fn sse_decoder_handles_split_utf8_and_crlf_boundaries() {
+        let frame = LogEventFrame {
+            job_id: JobId("héllo".to_owned()),
+            seq: 7,
+            stream: LogStreamProto::Stdout,
+            data: b"hello\n".to_vec(),
+            ts_millis: 11,
+        };
+        let body =
+            "id:7\r\ndata:{\"job_id\":\"héllo\",\"seq\":7,\"stream\":\"stdout\",\"data\":[104,101,108,108,111,10],\"ts_millis\":11}\r\n\r\n"
+                .to_owned();
+        let bytes = body.into_bytes();
+        let split = bytes
+            .iter()
+            .position(|byte| *byte == 0xC3)
+            .expect("utf8 byte")
+            + 1;
+
+        let mut decoder = SseFrameDecoder::default();
+        let mut frames = decoder.push(&bytes[..split]).expect("first chunk");
+        frames.extend(decoder.push(&bytes[split..]).expect("second chunk"));
+        frames.extend(decoder.finish().expect("finish"));
+
         assert_eq!(frames, vec![frame]);
     }
 }
