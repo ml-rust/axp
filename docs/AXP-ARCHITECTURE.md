@@ -199,10 +199,13 @@ AXP is designed to work with the existing MCP ecosystem, not around it.
    capability (surfaced via the index + schema-on-demand + code-mode SDK, and sandboxed and audited
    like any other capability).
 
-Current shipped surface: `axp serve` can mount exactly one static MCP tool provider when all four
-flags are supplied together: `--mcp-provider`, `--mcp-tool`, `--mcp-desc`, and `--mcp-bridge`. The
-bridge process is invoked directly via argv, with a fixed `call` prefix plus provider, tool, and
-params arguments.
+Current shipped surface: `axp serve` can mount static MCP tools in one of two ways. For a one-off
+tool, supply all four flags together: `--mcp-provider`, `--mcp-tool`, `--mcp-desc`, and
+`--mcp-bridge`. For one or more static tools from one provider, use `--mcp-config <path>` with a
+JSON file containing one `provider`, one `bridge`, and a non-empty `tools` list. The JSON format is
+narrow: one provider per file, no live MCP discovery, and no general AXP configuration surface. The
+bridge process is invoked directly via argv; bridge args default to `["call"]` in JSON configs and are
+followed by provider, tool, and params arguments.
 
 AXP internals are not coupled to MCP, and MCP is never required — it is one `Provider` implementation
 behind a clean interface.

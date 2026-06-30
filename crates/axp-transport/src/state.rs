@@ -86,20 +86,38 @@ impl AppState {
         desc: String,
         bridge_program: String,
     ) -> axp_core::Result<Self> {
+        Self::with_mcp_tools(
+            provider_id,
+            bridge_program,
+            static_mcp_bridge_args(),
+            vec![(tool_name, desc, static_mcp_schema())],
+        )
+    }
+
+    /// Build runtime state with the built-in providers plus one static MCP tool
+    /// provider containing the supplied tools.
+    pub fn with_mcp_tools(
+        provider_id: String,
+        bridge_program: String,
+        bridge_args: Vec<String>,
+        tools: Vec<(String, String, serde_json::Value)>,
+    ) -> axp_core::Result<Self> {
         let mut registry = builtin_registry();
-        let provider = McpToolProvider::new(
-            provider_id.clone(),
-            vec![McpToolDescriptor {
-                provider_id,
-                name: tool_name,
+        let bridge = McpBridgeCommand {
+            program: bridge_program,
+            args: bridge_args,
+        };
+        let descriptors = tools
+            .into_iter()
+            .map(|(name, desc, schema)| McpToolDescriptor {
+                provider_id: provider_id.clone(),
+                name,
                 desc,
-                schema: static_mcp_schema(),
-                bridge: McpBridgeCommand {
-                    program: bridge_program,
-                    args: static_mcp_bridge_args(),
-                },
-            }],
-        )?;
+                schema,
+                bridge: bridge.clone(),
+            })
+            .collect();
+        let provider = McpToolProvider::new(provider_id.clone(), descriptors)?;
         registry.register(Box::new(provider))?;
         Ok(Self::with_registry(registry))
     }
@@ -207,5 +225,47 @@ mod tests {
             .describe("search")
             .expect("registered MCP tool");
         assert_eq!(detail.schema, static_mcp_schema());
+    }
+
+    #[test]
+    fn with_mcp_tools_registers_multiple_static_tools() {
+        let state = AppState::with_mcp_tools(
+            "docs".to_owned(),
+            "axp-mcp-bridge".to_owned(),
+            vec!["call".to_owned(), "--json".to_owned()],
+            vec![
+                (
+                    "search".to_owned(),
+                    "Search documentation with an external MCP bridge".to_owned(),
+                    static_mcp_schema(),
+                ),
+                (
+                    "lookup".to_owned(),
+                    "Lookup documentation pages with an external MCP bridge".to_owned(),
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" }
+                        },
+                        "required": ["id"]
+                    }),
+                ),
+            ],
+        )
+        .expect("valid MCP mount");
+
+        let registry = state.registry.read().expect("registry lock");
+        assert!(registry.describe("search").is_ok());
+        let detail = registry.describe("lookup").expect("registered MCP tool");
+        assert_eq!(
+            detail.schema,
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"]
+            })
+        );
     }
 }
