@@ -161,6 +161,9 @@ impl SseFrameDecoder {
 }
 
 fn decode_sse_event(event: &[u8], frames: &mut Vec<LogEventFrame>) -> Result<()> {
+    let mut data = Vec::with_capacity(event.len());
+    let mut saw_data = false;
+
     for line in event.split(|byte| *byte == b'\n') {
         let line = if line.ends_with(b"\r") {
             &line[..line.len() - 1]
@@ -168,11 +171,20 @@ fn decode_sse_event(event: &[u8], frames: &mut Vec<LogEventFrame>) -> Result<()>
             line
         };
 
-        if let Some(data) = line.strip_prefix(b"data:") {
-            let frame = serde_json::from_slice::<LogEventFrame>(data)?;
-            frames.push(frame);
+        if let Some(line_data) = line.strip_prefix(b"data:") {
+            if saw_data {
+                data.push(b'\n');
+            }
+            saw_data = true;
+            data.extend_from_slice(line_data);
         }
     }
+
+    if saw_data {
+        let frame = serde_json::from_slice::<LogEventFrame>(&data)?;
+        frames.push(frame);
+    }
+
     Ok(())
 }
 
@@ -224,6 +236,24 @@ mod tests {
             serde_json::to_string(&frame).expect("json")
         );
         let frames = parse_sse_frames(body.as_bytes()).expect("frames");
+        assert_eq!(frames, vec![frame]);
+    }
+
+    #[test]
+    fn sse_multiple_data_lines_decode_one_frame() {
+        let frame = LogEventFrame {
+            job_id: JobId("j_2".to_owned()),
+            seq: 2,
+            stream: LogStreamProto::Stderr,
+            data: b"hello\nworld\n".to_vec(),
+            ts_millis: 12,
+        };
+        let json = serde_json::to_string(&frame).expect("json");
+        let split = json.find(',').expect("comma") + 1;
+        let body = format!("id:2\ndata:{}\ndata:{}\n\n", &json[..split], &json[split..]);
+
+        let frames = parse_sse_frames(body.as_bytes()).expect("frames");
+
         assert_eq!(frames, vec![frame]);
     }
 
