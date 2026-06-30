@@ -8,6 +8,7 @@
 //! - [`RuntimeCapability`] / [`CapabilitySet`] — structured, attenuable capability grants.
 //! - [`Session`] / [`SessionStore`] — runtime session lifecycle and in-memory store.
 //! - [`Provider`] / [`NativeProvider`] — runtime capability provider trait and in-memory impl.
+//! - [`McpToolProvider`] — static MCP tool adapter for the provider layer.
 //! - [`ProviderRegistry`] — aggregates providers and serves the unified discovery catalog.
 //! - [`builtin_registry`] — constructs the default registry pre-populated with built-in providers.
 //! - [`Job`] / [`JobStore`] — runtime job model, log buffering, and in-memory job store.
@@ -23,6 +24,7 @@ mod builtins;
 mod capability;
 mod error;
 mod job;
+mod mcp;
 mod provider;
 mod registry;
 mod session;
@@ -36,6 +38,7 @@ pub use job::{
     DEFAULT_LOG_BYTE_CAP, Job, JobEngine, JobLogStream, JobStatus, JobStore, LogBuffer, LogEvent,
     LogStream, Seq, resolve_cwd,
 };
+pub use mcp::{McpBridgeCommand, McpToolDescriptor, McpToolProvider};
 pub use provider::{
     CapabilityArg, CapabilityDescriptor, CapabilityListing, ExecutionSpec, NativeProvider,
     Provider, ResolvedCommand,
