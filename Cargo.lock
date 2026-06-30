@@ -124,6 +124,8 @@ dependencies = [
  "axp-proto",
  "axp-transport",
  "clap",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
