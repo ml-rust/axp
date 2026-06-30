@@ -5,8 +5,22 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use axp_core::{JobEngine, JobStore, ProviderRegistry, SessionStore, builtin_registry};
+use axp_core::{
+    JobEngine, JobStore, McpBridgeCommand, McpToolDescriptor, McpToolProvider, ProviderRegistry,
+    SessionStore, builtin_registry,
+};
 use axp_proto::SessionId;
+
+fn static_mcp_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": true
+    })
+}
+
+fn static_mcp_bridge_args() -> Vec<String> {
+    vec!["call".to_owned()]
+}
 
 /// Shared state for all axum request handlers.
 ///
@@ -43,10 +57,18 @@ impl AppState {
     ///
     /// This is the standard wiring used by the server and the tests.
     pub fn new() -> Self {
+        Self::with_registry(builtin_registry())
+    }
+
+    /// Build runtime state with a caller-supplied capability provider registry.
+    ///
+    /// The same registry instance is shared by the job engine and the public
+    /// discovery field.
+    pub fn with_registry(registry: ProviderRegistry) -> Self {
         let sessions = SessionStore::new();
         // One registry, shared by the engine (for resolving capability payloads)
         // and the `registry` field (for the discovery handlers).
-        let registry = Arc::new(RwLock::new(builtin_registry()));
+        let registry = Arc::new(RwLock::new(registry));
         let engine = JobEngine::new(sessions.clone(), JobStore::new(), Arc::clone(&registry));
         Self {
             sessions,
@@ -54,6 +76,32 @@ impl AppState {
             registry,
             session_counter: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Build runtime state with the built-in providers plus one static MCP tool
+    /// provider exposed through the existing provider registry.
+    pub fn with_mcp_tool(
+        provider_id: String,
+        tool_name: String,
+        desc: String,
+        bridge_program: String,
+    ) -> axp_core::Result<Self> {
+        let mut registry = builtin_registry();
+        let provider = McpToolProvider::new(
+            provider_id.clone(),
+            vec![McpToolDescriptor {
+                provider_id,
+                name: tool_name,
+                desc,
+                schema: static_mcp_schema(),
+                bridge: McpBridgeCommand {
+                    program: bridge_program,
+                    args: static_mcp_bridge_args(),
+                },
+            }],
+        )?;
+        registry.register(Box::new(provider))?;
+        Ok(Self::with_registry(registry))
     }
 
     /// Atomically allocate the next session id and return it formatted as
@@ -107,5 +155,57 @@ mod tests {
         let _id1 = state.next_session_id(); // consumes 1
         let id2 = clone.next_session_id(); // should consume 2
         assert_eq!(id2.as_str(), "s_2");
+    }
+
+    #[test]
+    fn with_registry_exposes_supplied_registry_and_starts_counter_at_one() {
+        let mut registry = ProviderRegistry::new();
+        let provider = McpToolProvider::new(
+            "docs",
+            vec![McpToolDescriptor {
+                provider_id: "docs".to_owned(),
+                name: "search".to_owned(),
+                desc: "Search documentation with an external MCP bridge".to_owned(),
+                schema: static_mcp_schema(),
+                bridge: McpBridgeCommand {
+                    program: "axp-mcp-bridge".to_owned(),
+                    args: static_mcp_bridge_args(),
+                },
+            }],
+        )
+        .expect("valid MCP provider");
+        registry
+            .register(Box::new(provider))
+            .expect("valid registry provider");
+
+        let state = AppState::with_registry(registry);
+
+        let index = state
+            .registry
+            .read()
+            .expect("registry lock")
+            .index()
+            .expect("registry index");
+        assert!(index.entries.iter().any(|entry| entry.name == "search"));
+        assert_eq!(state.next_session_id().as_str(), "s_1");
+    }
+
+    #[test]
+    fn with_mcp_tool_registers_static_mount() {
+        let state = AppState::with_mcp_tool(
+            "docs".to_owned(),
+            "search".to_owned(),
+            "Search documentation with an external MCP bridge".to_owned(),
+            "axp-mcp-bridge".to_owned(),
+        )
+        .expect("valid MCP mount");
+
+        let detail = state
+            .registry
+            .read()
+            .expect("registry lock")
+            .describe("search")
+            .expect("registered MCP tool");
+        assert_eq!(detail.schema, static_mcp_schema());
     }
 }

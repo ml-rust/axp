@@ -29,6 +29,30 @@ pub struct ServeArgs {
     /// Address to bind the server to.
     #[arg(long, default_value = "127.0.0.1:7300")]
     pub addr: std::net::SocketAddr,
+
+    /// Static MCP provider id to expose through the served runtime.
+    #[arg(long = "mcp-provider")]
+    pub mcp_provider: Option<String>,
+
+    /// Static MCP tool name to expose through the served runtime.
+    #[arg(long = "mcp-tool")]
+    pub mcp_tool: Option<String>,
+
+    /// Static MCP tool description to expose through the served runtime.
+    #[arg(long = "mcp-desc")]
+    pub mcp_desc: Option<String>,
+
+    /// Bridge program used to call the static MCP tool.
+    #[arg(long = "mcp-bridge")]
+    pub mcp_bridge: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ServeMcpTool {
+    provider_id: String,
+    tool_name: String,
+    desc: String,
+    bridge_program: String,
 }
 
 /// Entry point called from `main.rs`.
@@ -84,10 +108,43 @@ pub fn run() -> std::process::ExitCode {
 /// owns the `axum::serve` call so that `axum` is not a direct dep of this
 /// crate.
 async fn serve(args: ServeArgs) -> std::io::Result<()> {
-    let state = axp_transport::AppState::new();
-    let listener = tokio::net::TcpListener::bind(args.addr).await?;
-    println!("AXP runtime listening on http://{}", args.addr);
+    let addr = args.addr;
+    let state = match mcp_tool_mount(args)? {
+        Some(mount) => axp_transport::AppState::with_mcp_tool(
+            mount.provider_id,
+            mount.tool_name,
+            mount.desc,
+            mount.bridge_program,
+        )
+        .map_err(std::io::Error::other)?,
+        None => axp_transport::AppState::new(),
+    };
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("AXP runtime listening on http://{addr}");
     axp_transport::serve(listener, state).await
+}
+
+fn mcp_tool_mount(args: ServeArgs) -> std::io::Result<Option<ServeMcpTool>> {
+    match (
+        args.mcp_provider,
+        args.mcp_tool,
+        args.mcp_desc,
+        args.mcp_bridge,
+    ) {
+        (None, None, None, None) => Ok(None),
+        (Some(provider_id), Some(tool_name), Some(desc), Some(bridge_program)) => {
+            Ok(Some(ServeMcpTool {
+                provider_id,
+                tool_name,
+                desc,
+                bridge_program,
+            }))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--mcp-provider, --mcp-tool, --mcp-desc, and --mcp-bridge must be supplied together",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -117,6 +174,59 @@ mod tests {
         match cli.command {
             Some(Command::Serve(args)) => {
                 assert_eq!(args.addr.to_string(), "127.0.0.1:7300")
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_parses_mcp_tool_mount_flags() {
+        let cli = Cli::try_parse_from([
+            "axp",
+            "serve",
+            "--mcp-provider",
+            "docs",
+            "--mcp-tool",
+            "search",
+            "--mcp-desc",
+            "Search documentation with an external MCP bridge",
+            "--mcp-bridge",
+            "axp-mcp-bridge",
+        ])
+        .expect("parse");
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                assert_eq!(args.mcp_provider.as_deref(), Some("docs"));
+                assert_eq!(args.mcp_tool.as_deref(), Some("search"));
+                assert_eq!(
+                    args.mcp_desc.as_deref(),
+                    Some("Search documentation with an external MCP bridge")
+                );
+                assert_eq!(args.mcp_bridge.as_deref(), Some("axp-mcp-bridge"));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_serve_has_no_mcp_tool_mount() {
+        let cli = Cli::try_parse_from(["axp", "serve"]).expect("parse");
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                let mount = mcp_tool_mount(args).expect("valid default");
+                assert_eq!(mount, None);
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn partial_mcp_tool_mount_is_rejected() {
+        let cli = Cli::try_parse_from(["axp", "serve", "--mcp-provider", "docs"]).expect("parse");
+        match cli.command {
+            Some(Command::Serve(args)) => {
+                let err = mcp_tool_mount(args).expect_err("partial MCP args must fail");
+                assert!(err.to_string().contains("must be supplied together"));
             }
             other => panic!("expected Serve, got {other:?}"),
         }
