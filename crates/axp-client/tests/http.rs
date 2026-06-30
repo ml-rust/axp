@@ -4,20 +4,50 @@ use std::time::Duration;
 
 use axp_client::{AttachJobOptions, Client, Error};
 use axp_proto::{
-    Capability, EnforcementTier, IndexRequest, JobAttachRequest, JobPayload, JobStartRequest,
-    JobStartResponse, JobStatusProto, JobStatusRequest, SessionAuditRequest, SessionCloseRequest,
-    SessionOpenRequest, SessionOpenResponse,
+    Capability, DescribeRequest, EnforcementTier, IndexRequest, JobAttachRequest, JobPayload,
+    JobStartRequest, JobStartResponse, JobStatusProto, JobStatusRequest, SessionAuditRequest,
+    SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
 };
 
+const MCP_PROVIDER: &str = "mcp_docs";
+const MCP_BRIDGE: &str = "axp-mcp-bridge";
+const MCP_TOOL: &str = "mcp_search";
+const MCP_DESC: &str = "Search documentation with an external MCP bridge";
+
 async fn spawn_server() -> String {
+    spawn_server_with_state(axp_transport::AppState::new()).await
+}
+
+async fn spawn_server_with_state(state: axp_transport::AppState) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
     let addr = listener.local_addr().expect("local addr");
     tokio::spawn(async move {
-        let _ = axp_transport::serve(listener, axp_transport::AppState::new()).await;
+        let _ = axp_transport::serve(listener, state).await;
     });
     format!("http://{addr}")
+}
+
+fn mcp_search_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string"}
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+}
+
+fn mcp_search_state(schema: serde_json::Value) -> axp_transport::AppState {
+    axp_transport::AppState::with_mcp_tools(
+        MCP_PROVIDER.to_owned(),
+        MCP_BRIDGE.to_owned(),
+        vec!["call".to_owned()],
+        vec![(MCP_TOOL.to_owned(), MCP_DESC.to_owned(), schema)],
+    )
+    .expect("MCP tool state")
 }
 
 fn is_terminal(status: &JobStatusProto) -> bool {
@@ -189,6 +219,60 @@ async fn client_drives_session_job_and_attach_over_real_http() {
         .await
         .expect_err("closed session should not authorize");
     assert!(matches!(err, Error::Rpc { code: -32004, .. }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_discovers_and_describes_mcp_mounted_tool_over_real_http() {
+    let schema = mcp_search_schema();
+    let base = spawn_server_with_state(mcp_search_state(schema.clone())).await;
+    let client = Client::new(&base).expect("client");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().to_string_lossy().into_owned();
+
+    let session = client
+        .open_session(&SessionOpenRequest {
+            workspace,
+            sandbox_tier: EnforcementTier::DevNone,
+            capabilities: vec![Capability(format!("tool:{MCP_TOOL}"))],
+        })
+        .await
+        .expect("open session");
+
+    let index = client
+        .index(&IndexRequest {
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+        })
+        .await
+        .expect("index");
+    assert!(
+        index
+            .entries
+            .iter()
+            .any(|entry| entry.name == MCP_TOOL && entry.desc == MCP_DESC),
+        "expected mounted MCP tool in index, got {:?}",
+        index.entries
+    );
+
+    let detail = client
+        .describe(&DescribeRequest {
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+            name: MCP_TOOL.to_owned(),
+        })
+        .await
+        .expect("describe");
+    assert_eq!(detail.signature, "mcp_search(input: object): string");
+    assert_eq!(detail.schema, schema);
+
+    let closed = client
+        .close_session(&SessionCloseRequest {
+            session_id: session.session_id,
+            cap_token: session.cap_token,
+        })
+        .await
+        .expect("close session");
+    assert!(closed.ok);
 }
 
 #[tokio::test(flavor = "multi_thread")]
