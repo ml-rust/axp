@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{collections::HashMap, fs::File, path::Path};
 
 use serde::Deserialize;
 
@@ -67,6 +67,7 @@ impl McpConfigFile {
         }
 
         let mut tools = Vec::with_capacity(self.tools.len());
+        let mut tool_names = HashMap::with_capacity(self.tools.len());
         for (index, tool) in self.tools.into_iter().enumerate() {
             if tool.name.trim().is_empty() {
                 return Err(std::io::Error::new(
@@ -80,7 +81,17 @@ impl McpConfigFile {
                     format!("MCP config tool[{index}].desc must not be empty"),
                 ));
             }
-            tools.push((tool.name, tool.desc, tool.schema));
+            let name = tool.name;
+            if let Some(first_index) = tool_names.insert(name.clone(), index) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "MCP config tool[{index}].name duplicates tool[{first_index}].name `{}`",
+                        name
+                    ),
+                ));
+            }
+            tools.push((name, tool.desc, tool.schema));
         }
 
         Ok(McpConfigMount {
@@ -237,5 +248,33 @@ mod tests {
                 "expected `{expected}` in `{err}`"
             );
         }
+    }
+
+    #[test]
+    fn load_rejects_duplicate_tool_names() {
+        let file = write_config(
+            r#"{
+                "provider": "docs",
+                "bridge": { "program": "axp-mcp-bridge" },
+                "tools": [
+                    {
+                        "name": "search",
+                        "desc": "Search documentation with an external MCP bridge"
+                    },
+                    {
+                        "name": "search",
+                        "desc": "Search documentation again"
+                    }
+                ]
+            }"#,
+        );
+
+        let err = load(file.path()).expect_err("duplicate tool name must fail");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "MCP config tool[1].name duplicates tool[0].name `search`"
+        );
     }
 }
