@@ -78,6 +78,8 @@ pub async fn dispatch(state: &AppState, req: JsonRpcRequest) -> JsonRpcResponse 
 
     let result = match req.method.as_str() {
         "session.open" => handlers::session_open(state, req.params).await,
+        "session.close" => handlers::session_close(state, req.params).await,
+        "session.audit" => handlers::session_audit(state, req.params).await,
         "axp.index" => handlers::index(state, req.params).await,
         "axp.describe" => handlers::describe(state, req.params).await,
         "job.start" => handlers::job_start(state, req.params).await,

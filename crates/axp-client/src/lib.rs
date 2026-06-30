@@ -12,7 +12,8 @@ pub use error::{Error, Result, RpcError};
 use axp_proto::{
     DescribeRequest, DescribeResponse, IndexRequest, IndexResponse, JobAttachRequest,
     JobCancelRequest, JobCancelResponse, JobStartRequest, JobStartResponse, JobStatusRequest,
-    JobStatusResponse, LogEventFrame, SessionOpenRequest, SessionOpenResponse,
+    JobStatusResponse, LogEventFrame, SessionAuditRequest, SessionAuditResponse,
+    SessionCloseRequest, SessionCloseResponse, SessionOpenRequest, SessionOpenResponse,
 };
 
 /// Async HTTP client for an AXP runtime server.
@@ -112,6 +113,22 @@ impl Client {
     /// Open a workspace session.
     pub async fn open_session(&self, request: &SessionOpenRequest) -> Result<SessionOpenResponse> {
         self.rpc("session.open", request).await
+    }
+
+    /// Close a live workspace session.
+    pub async fn close_session(
+        &self,
+        request: &SessionCloseRequest,
+    ) -> Result<SessionCloseResponse> {
+        self.rpc("session.close", request).await
+    }
+
+    /// Return audit events for a live workspace session.
+    pub async fn session_audit(
+        &self,
+        request: &SessionAuditRequest,
+    ) -> Result<SessionAuditResponse> {
+        self.rpc("session.audit", request).await
     }
 
     /// Return the session capability catalog.

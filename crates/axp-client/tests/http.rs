@@ -5,7 +5,8 @@ use std::time::Duration;
 use axp_client::{AttachJobOptions, Client, Error};
 use axp_proto::{
     Capability, EnforcementTier, IndexRequest, JobAttachRequest, JobPayload, JobStartRequest,
-    JobStartResponse, JobStatusProto, JobStatusRequest, SessionOpenRequest, SessionOpenResponse,
+    JobStartResponse, JobStatusProto, JobStatusRequest, SessionAuditRequest, SessionCloseRequest,
+    SessionOpenRequest, SessionOpenResponse,
 };
 
 async fn spawn_server() -> String {
@@ -139,15 +140,55 @@ async fn client_drives_session_job_and_attach_over_real_http() {
 
     let frames = client
         .attach_job(&JobAttachRequest {
-            session_id: session.session_id,
-            cap_token: session.cap_token,
-            job_id: started.job_id,
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+            job_id: started.job_id.clone(),
             from_offset: 0,
         })
         .await
         .expect("attach");
     let output: Vec<u8> = frames.into_iter().flat_map(|frame| frame.data).collect();
     assert_eq!(String::from_utf8_lossy(&output), "axp-client\n");
+
+    let audit = client
+        .session_audit(&SessionAuditRequest {
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+        })
+        .await
+        .expect("session audit");
+    assert!(
+        audit
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, axp_proto::SessionAuditEventKind::SessionOpened)),
+        "expected session_opened audit event"
+    );
+    assert!(
+        audit.events.iter().any(|event| matches!(
+            &event.kind,
+            axp_proto::SessionAuditEventKind::JobFinished { job_id, .. } if job_id == &started.job_id
+        )),
+        "expected job_finished audit event"
+    );
+
+    let closed = client
+        .close_session(&SessionCloseRequest {
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+        })
+        .await
+        .expect("close session");
+    assert!(closed.ok);
+
+    let err = client
+        .index(&IndexRequest {
+            session_id: session.session_id,
+            cap_token: session.cap_token,
+        })
+        .await
+        .expect_err("closed session should not authorize");
+    assert!(matches!(err, Error::Rpc { code: -32004, .. }));
 }
 
 #[tokio::test(flavor = "multi_thread")]

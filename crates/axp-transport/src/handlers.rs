@@ -9,10 +9,13 @@
 //! handler to decode incoming parameters and encode outgoing results; do not
 //! duplicate their logic inline.
 
-use axp_core::{CapabilitySet, Workspace};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use axp_core::{AuditEvent, AuditEventKind, CapabilitySet, Workspace};
 use axp_proto::{
-    DescribeRequest, IndexRequest, JobCancelRequest, JobStartRequest, JobStatusRequest, SessionId,
-    SessionOpenRequest, SessionOpenResponse,
+    DescribeRequest, IndexRequest, JobCancelRequest, JobStartRequest, JobStatusRequest,
+    SessionAuditEvent, SessionAuditEventKind, SessionAuditRequest, SessionAuditResponse,
+    SessionCloseRequest, SessionCloseResponse, SessionId, SessionOpenRequest, SessionOpenResponse,
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -67,6 +70,41 @@ fn authenticated_session_capabilities(
     Ok(capabilities)
 }
 
+fn system_time_to_millis(timestamp: SystemTime) -> u64 {
+    let millis = timestamp
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    if millis > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        millis as u64
+    }
+}
+
+fn audit_event_to_wire(event: &AuditEvent) -> Result<SessionAuditEvent, TransportError> {
+    let kind = match &event.kind {
+        AuditEventKind::SessionOpened => SessionAuditEventKind::SessionOpened,
+        AuditEventKind::SessionClosed => SessionAuditEventKind::SessionClosed,
+        AuditEventKind::JobStarted { job_id } => SessionAuditEventKind::JobStarted {
+            job_id: job_id.clone(),
+        },
+        AuditEventKind::JobFinished { job_id, status } => SessionAuditEventKind::JobFinished {
+            job_id: job_id.clone(),
+            status: status.clone(),
+        },
+        other => {
+            return Err(TransportError::Internal(format!(
+                "unsupported session audit event kind: {other:?}"
+            )));
+        }
+    };
+    Ok(SessionAuditEvent {
+        ts_millis: system_time_to_millis(event.timestamp),
+        kind,
+    })
+}
+
 // ── Method handlers ────────────────────────────────────────────────────────────
 
 /// Handle `session.open`: open an isolated workspace session.
@@ -78,11 +116,8 @@ fn authenticated_session_capabilities(
 ///
 /// The `cap_token` is the unforgeable credential the client must present on
 /// subsequent calls; the `session_id` remains a non-secret addressing handle.
-///
-/// # Note
-///
-/// This handler mints, stores, and returns the token, but does **not** yet
-/// enforce it on subsequent RPC calls — that enforcement is a follow-up unit.
+/// Subsequent authenticated RPCs enforce the presented token and keep unknown
+/// sessions indistinguishable from bad tokens.
 pub(crate) async fn session_open(
     state: &AppState,
     params: serde_json::Value,
@@ -102,6 +137,56 @@ pub(crate) async fn session_open(
     state
         .sessions
         .open(id, workspace, req.sandbox_tier, caps, cap_token);
+    to_value(&resp)
+}
+
+/// Handle `session.close`: close a live session.
+///
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably). On success, the session is
+/// removed from the live store so subsequent authenticated calls with the same
+/// session id and token fail authorization.
+pub(crate) async fn session_close(
+    state: &AppState,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, TransportError> {
+    let req = parse_params::<SessionCloseRequest>(params)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
+    state
+        .sessions
+        .close(&req.session_id)
+        .map_err(|_| TransportError::Unauthorized)?;
+    to_value(&SessionCloseResponse { ok: true })
+}
+
+/// Handle `session.audit`: return audit events for a live session.
+///
+/// The caller is authenticated first (unknown session or invalid capability
+/// token → `UNAUTHORIZED`, indistinguishably). Audit events are cloned while
+/// holding the session read lock and serialized after the lock is released.
+pub(crate) async fn session_audit(
+    state: &AppState,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, TransportError> {
+    let req = parse_params::<SessionAuditRequest>(params)?;
+    require_authorized_session(state, &req.session_id, &req.cap_token)?;
+    let events = {
+        let session = state
+            .sessions
+            .get(&req.session_id)
+            .ok_or(TransportError::Unauthorized)?;
+        session
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .audit_events()
+            .to_vec()
+    };
+    let resp = SessionAuditResponse {
+        events: events
+            .iter()
+            .map(audit_event_to_wire)
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     to_value(&resp)
 }
 
@@ -272,6 +357,137 @@ mod tests {
     }
 
     // ── axp.index ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_close_invalidates_session() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, token) = open_session(&state, &dir).await;
+
+        let closed = call(
+            &state,
+            "session.close",
+            json!({ "session_id": sid.0, "cap_token": token }),
+        )
+        .await;
+        assert_eq!(closed["result"], json!({ "ok": true }));
+
+        let v = call(
+            &state,
+            "axp.index",
+            json!({ "session_id": sid.0, "cap_token": token }),
+        )
+        .await;
+        assert_eq!(
+            v["error"]["code"], UNAUTHORIZED,
+            "expected UNAUTHORIZED after close: {v}"
+        );
+        let _dir = dir;
+    }
+
+    #[tokio::test]
+    async fn session_close_bad_token_returns_unauthorized() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, _token) = open_session(&state, &dir).await;
+
+        let v = call(
+            &state,
+            "session.close",
+            json!({ "session_id": sid.0, "cap_token": "ct_wrong" }),
+        )
+        .await;
+        assert_eq!(
+            v["error"]["code"], UNAUTHORIZED,
+            "expected UNAUTHORIZED for bad token: {v}"
+        );
+        let _dir = dir;
+    }
+
+    #[tokio::test]
+    async fn session_audit_includes_open_and_job_events() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, token) = open_session(&state, &dir).await;
+
+        let started = call(
+            &state,
+            "job.start",
+            json!({
+                "session_id": sid.0,
+                "cap_token": token,
+                "kind": "command",
+                "command": "printf audit"
+            }),
+        )
+        .await;
+        let job_id = started["result"]["job_id"]
+            .as_str()
+            .expect("job_id must be string")
+            .to_owned();
+
+        let mut terminal = false;
+        for _ in 0..100 {
+            let status = call(
+                &state,
+                "job.status",
+                json!({ "session_id": sid.0, "cap_token": token, "job_id": job_id }),
+            )
+            .await;
+            if matches!(
+                status["result"]["status"]["status"].as_str(),
+                Some("exited" | "killed" | "failed")
+            ) {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(terminal, "job did not reach terminal state");
+
+        let audit = call(
+            &state,
+            "session.audit",
+            json!({ "session_id": sid.0, "cap_token": token }),
+        )
+        .await;
+        let events = audit["result"]["events"]
+            .as_array()
+            .expect("events must be an array");
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|event| event["event"].as_str())
+            .collect();
+        assert!(names.contains(&"session_opened"), "events: {events:?}");
+        assert!(names.contains(&"job_started"), "events: {events:?}");
+        assert!(names.contains(&"job_finished"), "events: {events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| event["ts_millis"].as_u64().is_some()),
+            "expected timestamps on audit events: {events:?}"
+        );
+        let _dir = dir;
+    }
+
+    #[tokio::test]
+    async fn session_audit_bad_token_returns_unauthorized() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, _token) = open_session(&state, &dir).await;
+
+        let v = call(
+            &state,
+            "session.audit",
+            json!({ "session_id": sid.0, "cap_token": "ct_wrong" }),
+        )
+        .await;
+        assert_eq!(
+            v["error"]["code"], UNAUTHORIZED,
+            "expected UNAUTHORIZED for bad token: {v}"
+        );
+        let _dir = dir;
+    }
 
     #[tokio::test]
     async fn index_valid_session_returns_builtin_entries() {
