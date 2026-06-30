@@ -268,4 +268,42 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn with_mcp_tools_resolves_bridge_invocation() {
+        let payload = serde_json::json!({"query": "rust"});
+        let state = AppState::with_mcp_tools(
+            "docs".to_owned(),
+            "axp-mcp-bridge".to_owned(),
+            vec!["call".to_owned(), "--json".to_owned()],
+            vec![(
+                "search".to_owned(),
+                "Search documentation with an external MCP bridge".to_owned(),
+                static_mcp_schema(),
+            )],
+        )
+        .expect("valid MCP mount");
+
+        let resolved = state
+            .registry
+            .read()
+            .expect("registry lock")
+            .resolve("search", &payload)
+            .expect("registered MCP tool");
+
+        assert_eq!(resolved.program, "axp-mcp-bridge");
+        assert_eq!(
+            resolved.args,
+            vec![
+                "call".to_owned(),
+                "--json".to_owned(),
+                "--provider".to_owned(),
+                "docs".to_owned(),
+                "--tool".to_owned(),
+                "search".to_owned(),
+                "--params".to_owned(),
+                payload.to_string(),
+            ]
+        );
+    }
 }
