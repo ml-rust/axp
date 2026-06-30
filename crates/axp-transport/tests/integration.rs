@@ -10,8 +10,8 @@ use std::sync::{Arc, RwLock, atomic::AtomicU64};
 use std::time::Duration;
 
 use axp_core::{
-    CapabilityArg, CapabilityDescriptor, ExecutionSpec, JobEngine, JobStore, NativeProvider,
-    ProviderRegistry, SessionStore,
+    CapabilityArg, CapabilityDescriptor, ExecutionSpec, JobEngine, JobStore, McpBridgeCommand,
+    McpToolDescriptor, McpToolProvider, NativeProvider, ProviderRegistry, SessionStore,
 };
 
 /// Terminal `JobStatusProto` discriminant values; shared by the poll helpers.
@@ -94,6 +94,34 @@ fn read_file_cap_state() -> axp_transport::AppState {
             args_template: vec![CapabilityArg::Param("path".to_string())],
         },
     })
+}
+
+/// Build an AppState whose registry holds a single static MCP-backed tool.
+fn mcp_tool_cap_state() -> axp_transport::AppState {
+    let provider = McpToolProvider::new(
+        "mcp_docs",
+        vec![McpToolDescriptor {
+            provider_id: "mcp_docs".to_string(),
+            name: "mcp_search".to_string(),
+            desc: "Search the configured MCP documentation index".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+            bridge: McpBridgeCommand {
+                program: "echo".to_string(),
+                args: vec!["call".to_string()],
+            },
+        }],
+    )
+    .expect("valid MCP tool provider");
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register(Box::new(provider))
+        .expect("register MCP provider");
+    axp_transport::AppState::with_registry(registry)
 }
 
 /// POST a JSON-RPC 2.0 request to `{base}/` and return the parsed response body.
@@ -709,6 +737,132 @@ async fn capability_invocation_over_http_runs_and_streams() {
     );
 
     let _dir = dir; // keep TempDir alive until end of test
+}
+
+// ── Test: MCP-mounted tool invocation uses bridge argv over HTTP ──────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_tool_invocation_over_http_runs_with_narrow_tool_grant() {
+    let base = spawn_server_with(mcp_tool_cap_state()).await;
+    let client = reqwest::Client::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    let open = rpc(
+        &client,
+        &base,
+        "session.open",
+        serde_json::json!({
+            "workspace": workspace,
+            "sandbox_tier": "dev-none",
+            "capabilities": ["tool:mcp_search"],
+        }),
+    )
+    .await;
+    assert!(
+        open.get("error").is_none(),
+        "session.open returned error: {open}"
+    );
+    let sid = open["result"]["session_id"]
+        .as_str()
+        .expect("session_id string")
+        .to_owned();
+    let token = open["result"]["cap_token"]
+        .as_str()
+        .expect("cap_token string")
+        .to_owned();
+
+    let start = rpc(
+        &client,
+        &base,
+        "job.start",
+        serde_json::json!({
+            "session_id": sid,
+            "cap_token": token,
+            "kind": "capability",
+            "name": "mcp_search",
+            "params": {"query": "rust && rm -rf /"},
+        }),
+    )
+    .await;
+    assert!(
+        start.get("error").is_none(),
+        "job.start returned error: {start}"
+    );
+    let jid = start["result"]["job_id"]
+        .as_str()
+        .expect("job_id string")
+        .to_owned();
+
+    let mut became_terminal = false;
+    for _ in 0..100 {
+        let status_resp = rpc(
+            &client,
+            &base,
+            "job.status",
+            serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
+        )
+        .await;
+        assert!(
+            status_resp.get("error").is_none(),
+            "job.status returned error: {status_resp}"
+        );
+        let discriminant = status_resp["result"]["status"]["status"]
+            .as_str()
+            .unwrap_or("");
+        if TERMINAL_STATUSES.contains(&discriminant) {
+            became_terminal = true;
+            assert_eq!(
+                discriminant, "exited",
+                "expected exited, got: {status_resp}"
+            );
+            let exit_code = status_resp["result"]["status"]["code"]
+                .as_i64()
+                .expect("code must be integer");
+            assert_eq!(exit_code, 0, "expected exit code 0, got: {exit_code}");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        became_terminal,
+        "MCP tool job {jid} did not reach a terminal state within the polling timeout"
+    );
+
+    let attach_resp = client
+        .get(format!(
+            "{base}/job/attach?session_id={sid}&cap_token={token}&job_id={jid}"
+        ))
+        .send()
+        .await
+        .expect("GET /job/attach");
+    assert_eq!(attach_resp.status(), 200, "attach must return 200");
+    let ctype = attach_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ctype.contains("text/event-stream"),
+        "content-type must be text/event-stream, got: {ctype}"
+    );
+    let body = attach_resp.text().await.expect("attach body text");
+    let log_bytes = collected_log_bytes(&body);
+    let log_text = String::from_utf8_lossy(&log_bytes);
+    assert!(
+        log_text.contains("call"),
+        "decoded log must contain the fixed bridge arg, got: {log_text:?} (raw body: {body})"
+    );
+    for expected in ["--provider", "mcp_docs", "--tool", "mcp_search", "--params"] {
+        assert!(
+            log_text.contains(expected),
+            "decoded log must contain {expected:?}, got: {log_text:?} (raw body: {body})"
+        );
+    }
+    assert!(
+        log_text.contains(r#""query":"rust && rm -rf /""#),
+        "decoded log must contain the request params, got: {log_text:?} (raw body: {body})"
+    );
 }
 
 // ── Test: read_file capability reads a known file over HTTP ───────────────────
