@@ -52,6 +52,21 @@ fn require_authorized_session(
     Ok(())
 }
 
+fn authenticated_session_capabilities(
+    state: &AppState,
+    id: &SessionId,
+    presented: &str,
+) -> Result<CapabilitySet, TransportError> {
+    require_authorized_session(state, id, presented)?;
+    let session = state.sessions.get(id).ok_or(TransportError::Unauthorized)?;
+    let capabilities = session
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .capabilities
+        .clone();
+    Ok(capabilities)
+}
+
 // ── Method handlers ────────────────────────────────────────────────────────────
 
 /// Handle `session.open`: open an isolated workspace session.
@@ -93,17 +108,16 @@ pub(crate) async fn session_open(
 /// Handle `axp.index`: return the full capability catalog for a session.
 ///
 /// The caller is authenticated first (unknown session or invalid capability
-/// token → `UNAUTHORIZED`, indistinguishably). The registry is global for now;
-/// it is not yet scoped per session.
+/// token → `UNAUTHORIZED`, indistinguishably). The returned catalog is scoped
+/// to the session grants.
 pub(crate) async fn index(
     state: &AppState,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<IndexRequest>(params)?;
-    require_authorized_session(state, &req.session_id, &req.cap_token)?;
-    // NOTE: registry is global for now; session_id is validated but not yet session-scoped.
+    let capabilities = authenticated_session_capabilities(state, &req.session_id, &req.cap_token)?;
     let reg = state.registry.read().unwrap_or_else(|p| p.into_inner());
-    let resp = reg.index()?;
+    let resp = reg.index_for_capabilities(&capabilities)?;
     to_value(&resp)
 }
 
@@ -111,16 +125,16 @@ pub(crate) async fn index(
 ///
 /// The caller is authenticated first (unknown session or invalid capability
 /// token → `UNAUTHORIZED`, indistinguishably). The capability name is then
-/// resolved from the global registry (unknown name → `NOT_FOUND`).
+/// resolved within the session-scoped catalog (unknown or ungranted name →
+/// `NOT_FOUND`).
 pub(crate) async fn describe(
     state: &AppState,
     params: serde_json::Value,
 ) -> Result<serde_json::Value, TransportError> {
     let req = parse_params::<DescribeRequest>(params)?;
-    require_authorized_session(state, &req.session_id, &req.cap_token)?;
-    // NOTE: registry is global for now; session_id is validated but not yet session-scoped.
+    let capabilities = authenticated_session_capabilities(state, &req.session_id, &req.cap_token)?;
     let reg = state.registry.read().unwrap_or_else(|p| p.into_inner());
-    let detail = reg.describe(&req.name)?;
+    let detail = reg.describe_for_capabilities(&req.name, &capabilities)?;
     to_value(&detail)
 }
 
@@ -206,6 +220,14 @@ mod tests {
     /// remains valid. The returned `cap_token` is the credential every
     /// authenticated call must present.
     async fn open_session(state: &AppState, dir: &tempfile::TempDir) -> (SessionId, String) {
+        open_session_with_capabilities(state, dir, &["proc.spawn"]).await
+    }
+
+    async fn open_session_with_capabilities(
+        state: &AppState,
+        dir: &tempfile::TempDir,
+        capabilities: &[&str],
+    ) -> (SessionId, String) {
         let ws = dir.path().to_string_lossy().into_owned();
         let v = call(
             state,
@@ -213,7 +235,7 @@ mod tests {
             json!({
                 "workspace": ws,
                 "sandbox_tier": "dev-none",
-                "capabilities": ["proc.spawn"]
+                "capabilities": capabilities
             }),
         )
         .await;
@@ -296,6 +318,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn index_tool_grant_returns_only_matching_capability() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, token) = open_session_with_capabilities(&state, &dir, &["tool:git_diff"]).await;
+
+        let v = call(
+            &state,
+            "axp.index",
+            json!({ "session_id": sid.0, "cap_token": token }),
+        )
+        .await;
+        let entries = v["result"]["entries"]
+            .as_array()
+            .expect("entries must be an array");
+        let names: Vec<&str> = entries.iter().filter_map(|e| e["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["git_diff"],
+            "unexpected index entries: {names:?}"
+        );
+        let _dir = dir; // keep alive
+    }
+
     // ── axp.describe ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -313,6 +359,63 @@ mod tests {
         assert_eq!(
             v["error"]["code"], NOT_FOUND,
             "expected NOT_FOUND for unknown capability: {v}"
+        );
+        let _dir = dir; // keep alive
+    }
+
+    #[tokio::test]
+    async fn describe_bad_token_returns_unauthorized() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, _token) = open_session(&state, &dir).await;
+
+        let v = call(
+            &state,
+            "axp.describe",
+            json!({ "session_id": sid.0, "cap_token": "ct_wrong", "name": "git_diff" }),
+        )
+        .await;
+        assert_eq!(
+            v["error"]["code"], UNAUTHORIZED,
+            "expected UNAUTHORIZED for bad token: {v}"
+        );
+        let _dir = dir; // keep alive
+    }
+
+    #[tokio::test]
+    async fn describe_tool_grant_returns_matching_capability_detail() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, token) = open_session_with_capabilities(&state, &dir, &["tool:git_diff"]).await;
+
+        let v = call(
+            &state,
+            "axp.describe",
+            json!({ "session_id": sid.0, "cap_token": token, "name": "git_diff" }),
+        )
+        .await;
+        assert_eq!(
+            v["result"]["signature"], "git_diff(): string",
+            "expected git_diff detail: {v}"
+        );
+        let _dir = dir; // keep alive
+    }
+
+    #[tokio::test]
+    async fn describe_tool_grant_hides_other_capabilities() {
+        let state = AppState::new();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sid, token) = open_session_with_capabilities(&state, &dir, &["tool:git_diff"]).await;
+
+        let v = call(
+            &state,
+            "axp.describe",
+            json!({ "session_id": sid.0, "cap_token": token, "name": "git_log" }),
+        )
+        .await;
+        assert_eq!(
+            v["error"]["code"], NOT_FOUND,
+            "expected NOT_FOUND for ungranted capability: {v}"
         );
         let _dir = dir; // keep alive
     }

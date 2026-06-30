@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    Error, Result,
+    CapabilitySet, Error, Result, RuntimeCapability,
     provider::{Provider, ResolvedCommand},
 };
 
@@ -161,6 +161,27 @@ impl ProviderRegistry {
         Ok(axp_proto::IndexResponse { entries })
     }
 
+    /// Returns the capability catalog visible to a session with `capabilities`.
+    ///
+    /// Discovery follows the same authorization model as capability execution:
+    /// `proc.spawn` exposes every provider capability, while `tool:<name>`
+    /// exposes only the exact registry-exposed capability name.
+    pub fn index_for_capabilities(
+        &self,
+        capabilities: &CapabilitySet,
+    ) -> Result<axp_proto::IndexResponse> {
+        let entries = self
+            .catalog
+            .iter()
+            .filter(|(exposed_name, _)| discovery_permitted(capabilities, exposed_name))
+            .map(|(exposed_name, entry)| axp_proto::IndexEntry {
+                name: exposed_name.clone(),
+                desc: entry.desc.clone(),
+            })
+            .collect();
+        Ok(axp_proto::IndexResponse { entries })
+    }
+
     /// Returns full detail for the capability identified by its **exposed** catalog name.
     ///
     /// The `name` must match an entry in the catalog (e.g. `"search"` when unambiguous, or
@@ -181,6 +202,24 @@ impl ProviderRegistry {
                 })?;
 
         provider.describe(&entry.local_name)
+    }
+
+    /// Returns full detail for a session-visible capability by exposed catalog name.
+    ///
+    /// Names outside `capabilities` are treated the same as unknown names and
+    /// return [`Error::CapabilityNotFound`], preventing discovery of ungranted
+    /// provider capabilities.
+    pub fn describe_for_capabilities(
+        &self,
+        name: &str,
+        capabilities: &CapabilitySet,
+    ) -> Result<axp_proto::CapabilityDetail> {
+        if !discovery_permitted(capabilities, name) {
+            return Err(Error::CapabilityNotFound {
+                name: name.to_owned(),
+            });
+        }
+        self.describe(name)
     }
 
     /// Resolve a capability by its exposed catalog name to a concrete argv command,
@@ -207,6 +246,14 @@ impl ProviderRegistry {
 
         provider.resolve(&entry.local_name, params)
     }
+}
+
+fn discovery_permitted(capabilities: &CapabilitySet, exposed_name: &str) -> bool {
+    capabilities.permits(&RuntimeCapability::ProcSpawn)
+        || capabilities
+            .grants()
+            .iter()
+            .any(|grant| matches!(grant, RuntimeCapability::Tool(name) if name == exposed_name))
 }
 
 impl Default for ProviderRegistry {
