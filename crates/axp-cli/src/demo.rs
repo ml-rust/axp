@@ -293,29 +293,50 @@ fn print_measurement(
     if json {
         println!("{}", serde_json::to_string(measurement)?);
     } else {
-        println!("runtime ok");
-        println!("total_ms={}", measurement.total_ms);
-        println!("session_open_ms={}", measurement.steps.session_open_ms);
-        println!("index_ms={}", measurement.steps.index_ms);
-        println!("describe_ms={}", measurement.steps.describe_ms);
-        println!("job_start_ms={}", measurement.steps.job_start_ms);
-        println!(
-            "job_status_poll_ms={}",
-            measurement.steps.job_status_poll_ms
-        );
-        println!("job_attach_ms={}", measurement.steps.job_attach_ms);
-        println!("catalog_count={}", measurement.catalog_count);
-        println!("described={}", measurement.described_capability);
-        println!("signature={}", measurement.described_signature);
-        println!("job_status={}", measurement.terminal_job_status);
-        println!("status_poll_count={}", measurement.status_poll_count);
-        println!("log_replay_success={}", measurement.log_replay_success);
-        println!("attach_bytes={}", measurement.attach_bytes);
-        println!("log_marker={}", measurement.log_marker);
-        println!("log={}", measurement.log_text);
+        print!("{}", format_human_measurement(measurement));
     }
 
     Ok(())
+}
+
+fn format_human_measurement(measurement: &RuntimeMeasurement) -> String {
+    format!(
+        concat!(
+            "runtime ok\n",
+            "total_ms={}\n",
+            "session_open_ms={}\n",
+            "index_ms={}\n",
+            "describe_ms={}\n",
+            "job_start_ms={}\n",
+            "job_status_poll_ms={}\n",
+            "job_attach_ms={}\n",
+            "catalog_count={}\n",
+            "described={}\n",
+            "signature={}\n",
+            "job_status={}\n",
+            "status_poll_count={}\n",
+            "log_replay_success={}\n",
+            "attach_bytes={}\n",
+            "log_marker={}\n",
+            "log={}\n"
+        ),
+        measurement.total_ms,
+        measurement.steps.session_open_ms,
+        measurement.steps.index_ms,
+        measurement.steps.describe_ms,
+        measurement.steps.job_start_ms,
+        measurement.steps.job_status_poll_ms,
+        measurement.steps.job_attach_ms,
+        measurement.catalog_count,
+        measurement.described_capability,
+        measurement.described_signature,
+        measurement.terminal_job_status,
+        measurement.status_poll_count,
+        measurement.log_replay_success,
+        measurement.attach_bytes,
+        measurement.log_marker,
+        measurement.log_text
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -351,7 +372,8 @@ mod tests {
 
     use super::{
         DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS, DemoArgs, DemoCommand,
-        RuntimeMeasurement, RuntimeStepDurations, is_success_status, status_label,
+        RuntimeMeasurement, RuntimeStepDurations, format_human_measurement, is_success_status,
+        status_label,
     };
 
     #[test]
@@ -425,26 +447,7 @@ mod tests {
 
     #[test]
     fn measurement_renders_as_single_json_object() {
-        let measurement = RuntimeMeasurement {
-            total_ms: 12,
-            steps: RuntimeStepDurations {
-                session_open_ms: 1,
-                index_ms: 2,
-                describe_ms: 3,
-                job_start_ms: 4,
-                job_status_poll_ms: 5,
-                job_attach_ms: 6,
-            },
-            catalog_count: 7,
-            described_capability: "proc.spawn".to_owned(),
-            described_signature: "sig".to_owned(),
-            terminal_job_status: "exited:0".to_owned(),
-            status_poll_count: 2,
-            log_replay_success: true,
-            attach_bytes: 18,
-            log_marker: "axp-runtime-smoke".to_owned(),
-            log_text: "axp-runtime-smoke".to_owned(),
-        };
+        let measurement = runtime_measurement();
 
         assert_eq!(
             serde_json::to_string(&measurement).expect("json"),
@@ -463,5 +466,56 @@ mod tests {
                 "\"log_text\":\"axp-runtime-smoke\"}"
             )
         );
+    }
+
+    #[test]
+    fn measurement_renders_as_human_readable_lines() {
+        let measurement = runtime_measurement();
+
+        assert_eq!(
+            format_human_measurement(&measurement),
+            concat!(
+                "runtime ok\n",
+                "total_ms=12\n",
+                "session_open_ms=1\n",
+                "index_ms=2\n",
+                "describe_ms=3\n",
+                "job_start_ms=4\n",
+                "job_status_poll_ms=5\n",
+                "job_attach_ms=6\n",
+                "catalog_count=7\n",
+                "described=proc.spawn\n",
+                "signature=sig\n",
+                "job_status=exited:0\n",
+                "status_poll_count=2\n",
+                "log_replay_success=true\n",
+                "attach_bytes=18\n",
+                "log_marker=axp-runtime-smoke\n",
+                "log=axp-runtime-smoke\n"
+            )
+        );
+    }
+
+    fn runtime_measurement() -> RuntimeMeasurement {
+        RuntimeMeasurement {
+            total_ms: 12,
+            steps: RuntimeStepDurations {
+                session_open_ms: 1,
+                index_ms: 2,
+                describe_ms: 3,
+                job_start_ms: 4,
+                job_status_poll_ms: 5,
+                job_attach_ms: 6,
+            },
+            catalog_count: 7,
+            described_capability: "proc.spawn".to_owned(),
+            described_signature: "sig".to_owned(),
+            terminal_job_status: "exited:0".to_owned(),
+            status_poll_count: 2,
+            log_replay_success: true,
+            attach_bytes: 18,
+            log_marker: "axp-runtime-smoke".to_owned(),
+            log_text: "axp-runtime-smoke".to_owned(),
+        }
     }
 }
