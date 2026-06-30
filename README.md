@@ -19,8 +19,7 @@ process — two things matter a lot: **safety** and **context cost**. AXP focuse
   loads full detail only for the tool it actually uses, so context stays small even with large catalogs.
 - **Reliable long-running work.** Jobs stream their output and can be detached from and reattached to,
   so work survives disconnects.
-- **Works with what you have.** AXP speaks MCP in both directions — mount existing MCP servers as
-  capabilities, or expose AXP to MCP clients.
+- **Works with what you have.** AXP can mount a static MCP tool into `axp serve`.
 
 **MCP connects agents to tools; AXP focuses on giving agents a safe place to run them.** Many setups
 will use both.
@@ -58,9 +57,19 @@ session always declares its enforcement tier so clients know the guarantee they'
 | ------------------------------- | ------------------------- |
 | Architecture draft              | In progress — see `docs/` |
 | Runtime (Rust)                  | Early development         |
-| MCP bridge                      | Planned                   |
+| MCP bridge                      | Static MCP tool mount      |
 | SDKs (TypeScript / Python / Go) | Planned                   |
 | Conformance suite               | Planned                   |
+
+Example:
+
+```bash
+axp serve \
+  --mcp-provider docs \
+  --mcp-tool search \
+  --mcp-desc "Search documentation with an external MCP bridge" \
+  --mcp-bridge axp-mcp-bridge
+```
 
 ## Contributing
 

@@ -5,12 +5,12 @@
 > **What AXP is.** An open protocol that gives AI agents a secure, streaming place to run code
 > and use tools — without exposing the host. AXP defines a **sandbox-and-capability contract**:
 > an isolated session, explicit least-privilege capabilities, OS-level sandboxing, and structured
-> streaming execution. It is **complementary to MCP** and can consume MCP servers as a capability
-> backend, or expose its own capabilities to MCP clients.
+> streaming execution. It is **complementary to MCP** and currently ships a static MCP tool mount
+> in `axp serve`.
 >
 > **Relationship to MCP.** MCP standardizes how agents discover and call tools. AXP focuses on a
-> different concern: giving an agent a safe, isolated environment to _execute_ in. The two compose —
-> AXP speaks MCP in both directions (see §8).
+> different concern: giving an agent a safe, isolated environment to _execute_ in. The two compose,
+> with current shipped support limited to a static MCP tool mount (see §8).
 
 This document describes the protocol's object model, layers, and security design. It is a working
 draft and will evolve through an open RFC process.
@@ -88,9 +88,6 @@ concern. Context efficiency lives entirely at L2: what enters the model's contex
    - **JSON-RPC 2.0** baseline (universal, MCP-compatible).
    - Optional negotiated **Cap'n Proto** (object-capability references) or **Protobuf** binary fast-path
      for latency-sensitive deployments.
-
-An optional human-facing project config file (`axp.kdl` / `axp.toml`) is under consideration; it is
-not part of the wire protocol or schema language.
 
 ---
 
@@ -193,7 +190,7 @@ file mutation, capability request, and network attempt) as a first-class primiti
 
 ---
 
-## 8. MCP interoperability — three modes
+## 8. MCP interoperability — current mount mode
 
 AXP is designed to work with the existing MCP ecosystem, not around it.
 
@@ -201,8 +198,11 @@ AXP is designed to work with the existing MCP ecosystem, not around it.
 2. **AXP + MCP** — the runtime **mounts MCP servers as a `Provider`**: each MCP tool becomes an AXP
    capability (surfaced via the index + schema-on-demand + code-mode SDK, and sandboxed and audited
    like any other capability).
-3. **AXP-as-MCP** — AXP capabilities are **exposed as an MCP server**, so existing MCP clients can use
-   AXP without changes.
+
+Current shipped surface: `axp serve` can mount exactly one static MCP tool provider when all four
+flags are supplied together: `--mcp-provider`, `--mcp-tool`, `--mcp-desc`, and `--mcp-bridge`. The
+bridge process is invoked directly via argv, with a fixed `call` prefix plus provider, tool, and
+params arguments.
 
 AXP internals are not coupled to MCP, and MCP is never required — it is one `Provider` implementation
 behind a clean interface.
