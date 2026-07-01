@@ -320,6 +320,27 @@ async fn attach_stream_uses_last_event_id_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn attach_job_decodes_rpc_error_response() {
+    let fixture = finished_command_job("printf 'attach-error\\n'").await;
+
+    let err = fixture
+        .client
+        .attach_job(&JobAttachRequest {
+            session_id: fixture.session.session_id,
+            cap_token: "ct_wrong".to_owned(),
+            job_id: fixture.started.job_id,
+            from_offset: 0,
+        })
+        .await
+        .expect_err("structured attach should return an RPC error");
+
+    let Error::Rpc { code, .. } = err else {
+        panic!("structured attach error should decode to Error::Rpc, got {err:?}");
+    };
+    assert_eq!(code, -32004);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_job_returns_http_status_for_non_rpc_not_found_response() {
     let base = spawn_server().await;
     let client = Client::new(format!("{base}/missing")).expect("client");
