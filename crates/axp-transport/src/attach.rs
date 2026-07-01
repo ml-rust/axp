@@ -431,6 +431,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_missing_required_query_fields_returns_bad_request_without_sse() {
+        let (state, sid, token, jid, _dir) = finished_job().await;
+        let router = build_router(state);
+        let cases = [
+            (
+                "missing session_id",
+                format!("/job/attach?cap_token={}&job_id={}", token, jid.0),
+            ),
+            (
+                "missing job_id",
+                format!("/job/attach?session_id={}&cap_token={}", sid.0, token),
+            ),
+        ];
+
+        for (case, uri) in cases {
+            let resp = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{case} must return HTTP 400"
+            );
+            assert_non_sse_response(&resp);
+        }
+    }
+
+    #[tokio::test]
     async fn attach_bad_token_does_not_stream_logs() {
         // A valid session+job but a WRONG cap_token must be rejected before the
         // log stream is built: the response must not be a 200 SSE stream.
