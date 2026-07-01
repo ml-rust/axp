@@ -29,6 +29,11 @@ async fn spawn_server_with_state(state: axp_transport::AppState) -> String {
     format!("http://{addr}")
 }
 
+async fn missing_route_client() -> Client {
+    let base = spawn_server().await;
+    Client::new(format!("{base}/missing")).expect("client")
+}
+
 fn mcp_search_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -466,8 +471,7 @@ async fn attach_job_decodes_rpc_error_response() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_job_returns_http_status_for_non_rpc_not_found_response() {
-    let base = spawn_server().await;
-    let client = Client::new(format!("{base}/missing")).expect("client");
+    let client = missing_route_client().await;
 
     let err = client
         .attach_job(&JobAttachRequest {
@@ -475,6 +479,21 @@ async fn attach_job_returns_http_status_for_non_rpc_not_found_response() {
             cap_token: "ct_dummy".to_owned(),
             job_id: JobId("j_dummy".to_owned()),
             from_offset: 0,
+        })
+        .await
+        .expect_err("non-RPC 404 response");
+
+    assert!(matches!(err, Error::HttpStatus(404)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn index_returns_http_status_for_non_rpc_not_found_response() {
+    let client = missing_route_client().await;
+
+    let err = client
+        .index(&IndexRequest {
+            session_id: SessionId("s_dummy".to_owned()),
+            cap_token: "ct_dummy".to_owned(),
         })
         .await
         .expect_err("non-RPC 404 response");
