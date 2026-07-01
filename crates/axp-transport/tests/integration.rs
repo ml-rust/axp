@@ -1095,6 +1095,73 @@ async fn index_with_wrong_cap_token_returns_unauthorized() {
     );
 }
 
+fn assert_unauthorized_without_result(resp: &serde_json::Value, context: &str) {
+    assert!(
+        resp.get("error").is_some(),
+        "expected JSON-RPC error for {context}, got: {resp}"
+    );
+    assert!(
+        resp.get("result").is_none(),
+        "must not have result when error is present for {context}: {resp}"
+    );
+    let code = resp["error"]["code"]
+        .as_i64()
+        .expect("error.code must be an integer");
+    assert_eq!(
+        code,
+        axp_transport::UNAUTHORIZED,
+        "expected UNAUTHORIZED for {context}, got code: {code} in response: {resp}"
+    );
+}
+
+// ── Security: closed session rejects job.status and job.cancel ───────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closed_session_rejects_job_status_and_cancel() {
+    let (base, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let workspace = dir.path().to_str().expect("workspace path utf-8");
+
+    let (sid, token, jid) = started_finished_job(&client, &base, workspace).await;
+
+    // Close the session, then verify the authenticated job methods reject
+    // with UNAUTHORIZED.
+    let close = rpc(
+        &client,
+        &base,
+        "session.close",
+        serde_json::json!({"session_id": sid, "cap_token": token}),
+    )
+    .await;
+    assert!(
+        close.get("error").is_none(),
+        "session.close returned error: {close}"
+    );
+    assert_eq!(
+        close["result"],
+        serde_json::json!({"ok": true}),
+        "session.close must succeed: {close}"
+    );
+
+    let status = rpc(
+        &client,
+        &base,
+        "job.status",
+        serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
+    )
+    .await;
+    assert_unauthorized_without_result(&status, "job.status after session close");
+
+    let cancel = rpc(
+        &client,
+        &base,
+        "job.cancel",
+        serde_json::json!({"session_id": sid, "cap_token": token, "job_id": jid}),
+    )
+    .await;
+    assert_unauthorized_without_result(&cancel, "job.cancel after session close");
+}
+
 // ── Security: missing token field → INVALID_PARAMS (required-field deser fail) ─
 
 #[tokio::test(flavor = "multi_thread")]
