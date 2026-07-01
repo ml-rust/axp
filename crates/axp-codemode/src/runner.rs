@@ -538,4 +538,17 @@ mod tests {
         let result = run.join().expect("runner thread");
         assert!(matches!(result, Err(Error::Run(_))));
     }
+
+    #[test]
+    fn foreign_interrupt_handle_is_rejected() {
+        let runner = CodeModeRunner::new().expect("runner config");
+        let foreign_runner = CodeModeRunner::new().expect("runner config");
+        let foreign_interrupt = foreign_runner.interrupt_handle();
+
+        assert!(matches!(
+            runner
+                .run_component_with_interrupt(NOOP_COMPONENT.as_bytes(), &foreign_interrupt),
+            Err(Error::Run(source)) if source.to_string() == "interrupt handle belongs to a different code-mode runner"
+        ));
+    }
 }
