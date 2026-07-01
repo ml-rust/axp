@@ -360,6 +360,91 @@ async fn attach_stream_next_frame_replays_multiple_frames() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn attach_stream_next_frame_reads_live_running_job() {
+    let base = spawn_server().await;
+    let client = Client::new(&base).expect("client");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = dir.path().to_string_lossy().into_owned();
+
+    let session = client
+        .open_session(&SessionOpenRequest {
+            workspace,
+            sandbox_tier: EnforcementTier::DevNone,
+            capabilities: vec![Capability("proc.spawn".to_owned())],
+        })
+        .await
+        .expect("open session");
+
+    let started = client
+        .start_job(&JobStartRequest {
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+            payload: JobPayload::Command {
+                command: "printf 'live-one\\n'; sleep 0.2; printf 'live-two\\n'".to_owned(),
+            },
+            cwd: None,
+            capabilities: Vec::new(),
+        })
+        .await
+        .expect("start job");
+
+    let attach = JobAttachRequest {
+        session_id: session.session_id.clone(),
+        cap_token: session.cap_token.clone(),
+        job_id: started.job_id.clone(),
+        from_offset: 0,
+    };
+    let mut stream = client
+        .attach_job_stream_with_options(&attach, AttachJobOptions::new())
+        .await
+        .expect("attach stream");
+
+    let first = tokio::time::timeout(Duration::from_secs(2), stream.next_frame())
+        .await
+        .expect("first live frame before timeout")
+        .expect("first frame")
+        .expect("stream should remain open until live output arrives");
+    assert_eq!(first.data, b"live-one\n");
+
+    let status = client
+        .job_status(&JobStatusRequest {
+            session_id: session.session_id.clone(),
+            cap_token: session.cap_token.clone(),
+            job_id: started.job_id.clone(),
+        })
+        .await
+        .expect("job status");
+    assert!(
+        !is_terminal(&status.status),
+        "first live frame should arrive before terminal job status"
+    );
+
+    let second = tokio::time::timeout(Duration::from_secs(2), stream.next_frame())
+        .await
+        .expect("second live frame before timeout")
+        .expect("second frame")
+        .expect("stream should remain open until live output arrives");
+    assert_eq!(second.data, b"live-two\n");
+    assert!(
+        first.seq < second.seq,
+        "live frame seqs must be monotonic: first={}, second={}",
+        first.seq,
+        second.seq
+    );
+
+    wait_for_terminal_job(&client, &session, &started).await;
+
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), stream.next_frame())
+            .await
+            .expect("stream eof before timeout")
+            .expect("stream eof")
+            .is_none(),
+        "stream should be at EOF after terminal output"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_job_decodes_rpc_error_response() {
     let fixture = finished_command_job("printf 'attach-error\\n'").await;
     let attach = finished_command_attach_request(&fixture);
