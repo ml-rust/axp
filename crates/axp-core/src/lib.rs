@@ -12,6 +12,8 @@
 //! - [`ProviderRegistry`] — aggregates providers and serves the unified discovery catalog.
 //! - [`builtin_registry`] — constructs the default registry pre-populated with built-in providers.
 //! - [`Job`] / [`JobStore`] — runtime job model, log buffering, and in-memory job store.
+//! - [`AppendLogEvent`] / [`JobReplayLog`] / [`FileJobReplayLog`] / [`LogBuffer`] / [`LogEvent`] /
+//!   [`LogStream`] / [`Seq`] — append/replay log types for job output.
 //!
 //! # Security note
 //!
@@ -35,8 +37,8 @@ pub use builtins::builtin_registry;
 pub use capability::{CapabilitySet, RuntimeCapability};
 pub use error::{Error, Result};
 pub use job::{
-    DEFAULT_LOG_BYTE_CAP, Job, JobEngine, JobLogStream, JobStatus, JobStore, LogBuffer, LogEvent,
-    LogStream, Seq, resolve_cwd,
+    AppendLogEvent, DEFAULT_LOG_BYTE_CAP, FileJobReplayLog, Job, JobEngine, JobLogStream,
+    JobReplayLog, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq, resolve_cwd,
 };
 pub use mcp::{McpBridgeCommand, McpToolDescriptor, McpToolProvider};
 pub use provider::{

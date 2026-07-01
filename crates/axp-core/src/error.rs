@@ -106,6 +106,27 @@ pub enum Error {
         cap: usize,
     },
 
+    /// A replay log file operation failed.
+    #[error("replay log I/O error at `{path}`: {source}")]
+    ReplayLogIo {
+        /// The replay log path.
+        path: std::path::PathBuf,
+        /// The underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A replay log file could not be decoded as a valid append-only log.
+    #[error("corrupt replay log at `{path}` offset {offset}: {reason}")]
+    ReplayLogCorrupt {
+        /// The replay log path.
+        path: std::path::PathBuf,
+        /// Byte offset where corruption was detected.
+        offset: u64,
+        /// Human-readable reason for the failure.
+        reason: String,
+    },
+
     /// The requested sandbox enforcement tier cannot be honored on this host;
     /// the job is failed rather than run unconfined.
     #[error("sandbox unavailable: {source}")]

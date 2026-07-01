@@ -1,8 +1,11 @@
 //! Append-only, replayable job log for stdout/stderr output.
 
 use std::borrow::Cow;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
@@ -46,6 +49,12 @@ pub struct AppendLogEvent {
 
 /// Default log-buffer byte cap: 64 MiB.
 pub const DEFAULT_LOG_BYTE_CAP: usize = 64 * 1024 * 1024;
+
+const FILE_LOG_MAGIC: &[u8] = b"AXPJOBLOG1\n";
+const FILE_LOG_HEADER_LEN: u64 = FILE_LOG_MAGIC.len() as u64;
+const FILE_LOG_FRAME_FIXED_LEN: usize = 8 + 1 + 8 + 4 + 8;
+const STREAM_STDOUT: u8 = 1;
+const STREAM_STDERR: u8 = 2;
 
 /// Replay result returned by a [`JobReplayLog`].
 ///
@@ -201,6 +210,149 @@ impl JobReplayLog for InMemoryJobReplayLog {
     }
 }
 
+/// File-backed implementation of [`JobReplayLog`].
+///
+/// The on-disk format is an append-only binary stream:
+///
+/// - magic header: `AXPJOBLOG1\n`
+/// - repeated frames: `seq:u64`, `stream:u8`, `timestamp_secs:i64`,
+///   `timestamp_nanos:u32`, `data_len:u64`, then `data_len` raw bytes.
+///
+/// Opening a log validates every complete frame, including sequence continuity.
+/// Any truncated frame, invalid stream tag, invalid timestamp, or sequence gap is
+/// reported as corruption rather than silently ignored.
+#[derive(Debug)]
+pub struct FileJobReplayLog {
+    path: PathBuf,
+    file: File,
+    events: Vec<LogEvent>,
+    byte_total: usize,
+    byte_cap: usize,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl FileJobReplayLog {
+    /// Open or create a file-backed replay log with the [`DEFAULT_LOG_BYTE_CAP`].
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_cap(path, DEFAULT_LOG_BYTE_CAP)
+    }
+
+    /// Open or create a file-backed replay log with an explicit byte cap.
+    pub fn with_cap(path: impl AsRef<Path>, byte_cap: usize) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)
+            .map_err(|source| Error::ReplayLogIo {
+                path: path.clone(),
+                source,
+            })?;
+
+        if file
+            .metadata()
+            .map(|metadata| metadata.len())
+            .map_err(|source| Error::ReplayLogIo {
+                path: path.clone(),
+                source,
+            })?
+            == 0
+        {
+            file.write_all(FILE_LOG_MAGIC)
+                .and_then(|()| file.sync_all())
+                .map_err(|source| Error::ReplayLogIo {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+
+        file.seek(SeekFrom::Start(0))
+            .map_err(|source| Error::ReplayLogIo {
+                path: path.clone(),
+                source,
+            })?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| Error::ReplayLogIo {
+                path: path.clone(),
+                source,
+            })?;
+        let (events, byte_total) = decode_file_log(&path, &bytes, byte_cap)?;
+
+        file.seek(SeekFrom::End(0))
+            .map_err(|source| Error::ReplayLogIo {
+                path: path.clone(),
+                source,
+            })?;
+
+        Ok(Self {
+            path,
+            file,
+            events,
+            byte_total,
+            byte_cap,
+            notify: Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+
+    /// Return all events with `seq >= from_seq` as a borrowed slice.
+    ///
+    /// If `from_seq` is past the end of the log an empty slice is returned.
+    pub fn since(&self, from_seq: Seq) -> &[LogEvent] {
+        let start = (from_seq as usize).min(self.events.len());
+        &self.events[start..]
+    }
+}
+
+impl JobReplayLog for FileJobReplayLog {
+    fn append(&mut self, event: AppendLogEvent) -> Result<Seq> {
+        let new_total = self
+            .byte_total
+            .checked_add(event.data.len())
+            .ok_or(Error::LogBufferOverflow { cap: self.byte_cap })?;
+        if new_total > self.byte_cap {
+            return Err(Error::LogBufferOverflow { cap: self.byte_cap });
+        }
+
+        let seq = seq_from_len(self.events.len(), &self.path, self.events.len() as u64)?;
+        let frame = encode_frame(&self.path, seq, &event)?;
+        self.file
+            .write_all(&frame)
+            .and_then(|()| self.file.sync_data())
+            .map_err(|source| Error::ReplayLogIo {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        self.byte_total = new_total;
+        self.events.push(LogEvent {
+            seq,
+            stream: event.stream,
+            data: event.data,
+            timestamp: event.timestamp,
+        });
+        self.notify.notify_waiters();
+        Ok(seq)
+    }
+
+    fn replay_from(&self, from_seq: Seq) -> LogReplay<'_> {
+        LogReplay::borrowed(self.since(from_seq))
+    }
+
+    fn subscribe(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    fn next_seq(&self) -> Seq {
+        self.events.len() as Seq
+    }
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+}
+
 /// An append-only, replayable buffer of a job's log events.
 ///
 /// This is the repo-native in-memory facade used by current callers. The
@@ -299,6 +451,251 @@ impl JobReplayLog for LogBuffer {
 
     fn len(&self) -> usize {
         self.inner.len()
+    }
+}
+
+fn seq_from_len(len: usize, path: &Path, offset: u64) -> Result<Seq> {
+    Seq::try_from(len).map_err(|_| Error::ReplayLogCorrupt {
+        path: path.to_path_buf(),
+        offset,
+        reason: "event count exceeds sequence range".to_string(),
+    })
+}
+
+fn encode_frame(path: &Path, seq: Seq, event: &AppendLogEvent) -> Result<Vec<u8>> {
+    let (secs, nanos) = encode_timestamp(event.timestamp, path, 0)?;
+    let data_len = u64::try_from(event.data.len()).map_err(|_| Error::ReplayLogCorrupt {
+        path: path.to_path_buf(),
+        offset: 0,
+        reason: "log event data length exceeds frame range".to_string(),
+    })?;
+    let frame_cap = FILE_LOG_FRAME_FIXED_LEN
+        .checked_add(event.data.len())
+        .ok_or_else(|| Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset: 0,
+            reason: "frame length exceeds addressable memory".to_string(),
+        })?;
+    let mut frame = Vec::with_capacity(frame_cap);
+    frame.extend_from_slice(&seq.to_le_bytes());
+    frame.push(encode_stream(event.stream));
+    frame.extend_from_slice(&secs.to_le_bytes());
+    frame.extend_from_slice(&nanos.to_le_bytes());
+    frame.extend_from_slice(&data_len.to_le_bytes());
+    frame.extend_from_slice(&event.data);
+    Ok(frame)
+}
+
+fn decode_file_log(path: &Path, bytes: &[u8], byte_cap: usize) -> Result<(Vec<LogEvent>, usize)> {
+    if !bytes.starts_with(FILE_LOG_MAGIC) {
+        return Err(Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset: 0,
+            reason: "missing replay log magic header".to_string(),
+        });
+    }
+
+    let mut offset = FILE_LOG_HEADER_LEN as usize;
+    let mut events = Vec::new();
+    let mut byte_total = 0usize;
+
+    while offset < bytes.len() {
+        let frame_start = offset;
+        let seq = read_u64(path, bytes, &mut offset)?;
+        let stream = decode_stream(read_u8(path, bytes, &mut offset)?, path, frame_start as u64)?;
+        let secs = read_i64(path, bytes, &mut offset)?;
+        let nanos = read_u32(path, bytes, &mut offset)?;
+        let data_len = read_u64(path, bytes, &mut offset)?;
+        let data_len_usize = usize::try_from(data_len).map_err(|_| Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset: frame_start as u64,
+            reason: "frame data length exceeds addressable memory".to_string(),
+        })?;
+        let data_end =
+            offset
+                .checked_add(data_len_usize)
+                .ok_or_else(|| Error::ReplayLogCorrupt {
+                    path: path.to_path_buf(),
+                    offset: frame_start as u64,
+                    reason: "frame data length overflows file offset".to_string(),
+                })?;
+        if data_end > bytes.len() {
+            return Err(Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset: offset as u64,
+                reason: "truncated frame data".to_string(),
+            });
+        }
+        let expected_seq = seq_from_len(events.len(), path, frame_start as u64)?;
+        if seq != expected_seq {
+            return Err(Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset: frame_start as u64,
+                reason: format!("expected seq {expected_seq}, found {seq}"),
+            });
+        }
+        byte_total = byte_total
+            .checked_add(data_len_usize)
+            .ok_or(Error::LogBufferOverflow { cap: byte_cap })?;
+        if byte_total > byte_cap {
+            return Err(Error::LogBufferOverflow { cap: byte_cap });
+        }
+        events.push(LogEvent {
+            seq,
+            stream,
+            data: Bytes::copy_from_slice(&bytes[offset..data_end]),
+            timestamp: decode_timestamp(secs, nanos, path, frame_start as u64)?,
+        });
+        offset = data_end;
+    }
+
+    Ok((events, byte_total))
+}
+
+fn read_u8(path: &Path, bytes: &[u8], offset: &mut usize) -> Result<u8> {
+    let value = *bytes.get(*offset).ok_or_else(|| Error::ReplayLogCorrupt {
+        path: path.to_path_buf(),
+        offset: *offset as u64,
+        reason: "truncated frame".to_string(),
+    })?;
+    *offset += 1;
+    Ok(value)
+}
+
+fn read_u32(path: &Path, bytes: &[u8], offset: &mut usize) -> Result<u32> {
+    let end = checked_read_end(path, bytes, *offset, 4)?;
+    let mut raw = [0; 4];
+    raw.copy_from_slice(&bytes[*offset..end]);
+    *offset = end;
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_i64(path: &Path, bytes: &[u8], offset: &mut usize) -> Result<i64> {
+    let end = checked_read_end(path, bytes, *offset, 8)?;
+    let mut raw = [0; 8];
+    raw.copy_from_slice(&bytes[*offset..end]);
+    *offset = end;
+    Ok(i64::from_le_bytes(raw))
+}
+
+fn read_u64(path: &Path, bytes: &[u8], offset: &mut usize) -> Result<u64> {
+    let end = checked_read_end(path, bytes, *offset, 8)?;
+    let mut raw = [0; 8];
+    raw.copy_from_slice(&bytes[*offset..end]);
+    *offset = end;
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn checked_read_end(path: &Path, bytes: &[u8], offset: usize, len: usize) -> Result<usize> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset: offset as u64,
+            reason: "frame offset overflow".to_string(),
+        })?;
+    if end > bytes.len() {
+        return Err(Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset: offset as u64,
+            reason: "truncated frame".to_string(),
+        });
+    }
+    Ok(end)
+}
+
+fn encode_stream(stream: LogStream) -> u8 {
+    match stream {
+        LogStream::Stdout => STREAM_STDOUT,
+        LogStream::Stderr => STREAM_STDERR,
+    }
+}
+
+fn decode_stream(tag: u8, path: &Path, offset: u64) -> Result<LogStream> {
+    match tag {
+        STREAM_STDOUT => Ok(LogStream::Stdout),
+        STREAM_STDERR => Ok(LogStream::Stderr),
+        _ => Err(Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset,
+            reason: format!("invalid stream tag {tag}"),
+        }),
+    }
+}
+
+fn encode_timestamp(timestamp: SystemTime, path: &Path, offset: u64) -> Result<(i64, u32)> {
+    match timestamp.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = i64::try_from(duration.as_secs()).map_err(|_| Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset,
+                reason: "timestamp seconds exceed frame range".to_string(),
+            })?;
+            Ok((secs, duration.subsec_nanos()))
+        }
+        Err(err) => {
+            let duration = err.duration();
+            let secs = i64::try_from(duration.as_secs()).map_err(|_| Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset,
+                reason: "timestamp seconds exceed frame range".to_string(),
+            })?;
+            if duration.subsec_nanos() == 0 {
+                Ok((-secs, 0))
+            } else {
+                let shifted_secs = secs.checked_add(1).ok_or_else(|| Error::ReplayLogCorrupt {
+                    path: path.to_path_buf(),
+                    offset,
+                    reason: "timestamp seconds exceed frame range".to_string(),
+                })?;
+                Ok((-shifted_secs, 1_000_000_000 - duration.subsec_nanos()))
+            }
+        }
+    }
+}
+
+fn decode_timestamp(secs: i64, nanos: u32, path: &Path, offset: u64) -> Result<SystemTime> {
+    if nanos >= 1_000_000_000 {
+        return Err(Error::ReplayLogCorrupt {
+            path: path.to_path_buf(),
+            offset,
+            reason: format!("invalid timestamp nanos {nanos}"),
+        });
+    }
+
+    if secs >= 0 {
+        UNIX_EPOCH
+            .checked_add(Duration::new(secs as u64, nanos))
+            .ok_or_else(|| Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset,
+                reason: "timestamp exceeds system time range".to_string(),
+            })
+    } else if nanos == 0 {
+        UNIX_EPOCH
+            .checked_sub(Duration::new(secs.unsigned_abs(), 0))
+            .ok_or_else(|| Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset,
+                reason: "timestamp exceeds system time range".to_string(),
+            })
+    } else {
+        let secs_before_epoch =
+            secs.unsigned_abs()
+                .checked_sub(1)
+                .ok_or_else(|| Error::ReplayLogCorrupt {
+                    path: path.to_path_buf(),
+                    offset,
+                    reason: "timestamp exceeds system time range".to_string(),
+                })?;
+        let nanos_before_epoch = 1_000_000_000 - nanos;
+        UNIX_EPOCH
+            .checked_sub(Duration::new(secs_before_epoch, nanos_before_epoch))
+            .ok_or_else(|| Error::ReplayLogCorrupt {
+                path: path.to_path_buf(),
+                offset,
+                reason: "timestamp exceeds system time range".to_string(),
+            })
     }
 }
 
@@ -425,5 +822,139 @@ mod tests {
         assert_eq!(replay.events().len(), 1);
         assert_eq!(replay.events()[0].data.as_ref(), b"ab");
         assert_eq!(log.next_seq(), 1);
+    }
+
+    #[test]
+    fn file_replay_log_reopens_without_renumbering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.log");
+        let first_timestamp = UNIX_EPOCH + Duration::new(42, 7);
+        let second_timestamp = UNIX_EPOCH + Duration::new(43, 8);
+        let third_timestamp = UNIX_EPOCH + Duration::new(44, 9);
+
+        {
+            let mut log = FileJobReplayLog::open(&path).unwrap();
+            assert_eq!(
+                log.append(AppendLogEvent {
+                    stream: LogStream::Stdout,
+                    data: Bytes::copy_from_slice(b"hello\0raw"),
+                    timestamp: first_timestamp,
+                })
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                log.append(AppendLogEvent {
+                    stream: LogStream::Stderr,
+                    data: Bytes::copy_from_slice(b"stderr"),
+                    timestamp: second_timestamp,
+                })
+                .unwrap(),
+                1
+            );
+            assert_eq!(log.next_seq(), 2);
+        }
+
+        let mut reopened = FileJobReplayLog::open(&path).unwrap();
+        let replay = reopened.replay_from(1);
+        assert_eq!(replay.events().len(), 1);
+        assert_eq!(replay.events()[0].seq, 1);
+        assert_eq!(replay.events()[0].stream, LogStream::Stderr);
+        assert_eq!(replay.events()[0].data.as_ref(), b"stderr");
+        assert_eq!(replay.events()[0].timestamp, second_timestamp);
+        assert_eq!(reopened.next_seq(), 2);
+
+        assert_eq!(
+            reopened
+                .append(AppendLogEvent {
+                    stream: LogStream::Stdout,
+                    data: Bytes::copy_from_slice(b"after-reopen"),
+                    timestamp: third_timestamp,
+                })
+                .unwrap(),
+            2
+        );
+
+        let reopened_again = FileJobReplayLog::open(&path).unwrap();
+        let replay = reopened_again.replay_from(0);
+        let seqs: Vec<Seq> = replay.events().iter().map(|event| event.seq).collect();
+        let bytes: Vec<&[u8]> = replay
+            .events()
+            .iter()
+            .map(|event| event.data.as_ref())
+            .collect();
+        assert_eq!(seqs, vec![0, 1, 2]);
+        assert_eq!(
+            bytes,
+            vec![
+                b"hello\0raw".as_slice(),
+                b"stderr".as_slice(),
+                b"after-reopen".as_slice()
+            ]
+        );
+        assert_eq!(reopened_again.next_seq(), 3);
+    }
+
+    #[test]
+    fn file_replay_log_preserves_pre_epoch_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.log");
+        let timestamp = UNIX_EPOCH - Duration::new(2, 250);
+
+        {
+            let mut log = FileJobReplayLog::open(&path).unwrap();
+            log.append(AppendLogEvent {
+                stream: LogStream::Stdout,
+                data: Bytes::copy_from_slice(b"before-epoch"),
+                timestamp,
+            })
+            .unwrap();
+        }
+
+        let reopened = FileJobReplayLog::open(&path).unwrap();
+        let replay = reopened.replay_from(0);
+        assert_eq!(replay.events()[0].timestamp, timestamp);
+    }
+
+    #[test]
+    fn file_replay_log_detects_truncated_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.log");
+        std::fs::write(&path, FILE_LOG_MAGIC).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&0u64.to_le_bytes())
+            .unwrap();
+
+        let result = FileJobReplayLog::open(&path);
+        assert!(
+            matches!(result, Err(Error::ReplayLogCorrupt { .. })),
+            "expected ReplayLogCorrupt for truncated frame, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn file_replay_log_overflow_is_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.log");
+        let mut log = FileJobReplayLog::with_cap(&path, 3).unwrap();
+        append_chunk(&mut log, b"ab").unwrap();
+
+        let result = append_chunk(&mut log, b"cd");
+        assert!(
+            matches!(result, Err(Error::LogBufferOverflow { cap: 3 })),
+            "expected LogBufferOverflow(cap=3), got {result:?}"
+        );
+        assert_eq!(log.next_seq(), 1);
+        drop(log);
+
+        let reopened = FileJobReplayLog::with_cap(&path, 3).unwrap();
+        let replay = reopened.replay_from(0);
+        assert_eq!(replay.events().len(), 1);
+        assert_eq!(replay.events()[0].seq, 0);
+        assert_eq!(replay.events()[0].data.as_ref(), b"ab");
+        assert_eq!(reopened.next_seq(), 1);
     }
 }
