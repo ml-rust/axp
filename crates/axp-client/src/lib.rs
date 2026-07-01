@@ -236,3 +236,30 @@ impl Client {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(input: &str) -> Client {
+        Client::new(input).expect("client")
+    }
+
+    #[test]
+    fn new_normalizes_http_base_url() {
+        for (input, expected) in [
+            ("http://example.test:8080", "http://example.test:8080/"),
+            ("http://example.test/api", "http://example.test/api/"),
+        ] {
+            assert_eq!(client(input).base_url.as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn new_rejects_unsupported_scheme() {
+        let err = Client::new("https://example.test").expect_err("invalid base URL");
+        assert!(
+            matches!(err, Error::InvalidBaseUrl(message) if message.contains("unsupported scheme"))
+        );
+    }
+}
