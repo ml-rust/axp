@@ -45,13 +45,11 @@ use axp_proto::{
 };
 use axp_sandbox::{SandboxError, SandboxPolicy};
 
+use super::log::{AppendLogEvent, DEFAULT_LOG_BYTE_CAP, JobReplayLog};
 use crate::{
     Error, Result,
     capability::{CapabilitySet, RuntimeCapability},
-    job::{
-        DEFAULT_LOG_BYTE_CAP, Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq,
-        resolve_cwd,
-    },
+    job::{Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq, resolve_cwd},
     provider::ResolvedCommand,
     registry::ProviderRegistry,
     session::{AuditEventKind, SessionStore},
@@ -579,7 +577,14 @@ impl JobEngine {
                     match n {
                         Ok(0) | Err(_) => out_done = true,
                         Ok(n) => {
-                            if self.push_log(&handle, LogStream::Stdout, &buf_out[..n]).is_err() {
+                            if self
+                                .push_log(
+                                    &handle,
+                                    LogStream::Stdout,
+                                    Bytes::copy_from_slice(&buf_out[..n]),
+                                )
+                                .is_err()
+                            {
                                 overflowed = true;
                                 let _ = child.start_kill();
                                 out_done = true;
@@ -593,7 +598,14 @@ impl JobEngine {
                     match n {
                         Ok(0) | Err(_) => err_done = true,
                         Ok(n) => {
-                            if self.push_log(&handle, LogStream::Stderr, &buf_err[..n]).is_err() {
+                            if self
+                                .push_log(
+                                    &handle,
+                                    LogStream::Stderr,
+                                    Bytes::copy_from_slice(&buf_err[..n]),
+                                )
+                                .is_err()
+                            {
                                 overflowed = true;
                                 let _ = child.start_kill();
                                 out_done = true;
@@ -642,10 +654,13 @@ impl JobEngine {
     /// # Errors
     ///
     /// Propagates [`Error::LogBufferOverflow`] from the underlying buffer.
-    fn push_log(&self, handle: &Arc<RwLock<Job>>, stream: LogStream, bytes: &[u8]) -> Result<()> {
+    fn push_log(&self, handle: &Arc<RwLock<Job>>, stream: LogStream, data: Bytes) -> Result<()> {
         let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
-        job.log_buffer
-            .push(stream, Bytes::copy_from_slice(bytes), SystemTime::now())?;
+        job.log_buffer.append(AppendLogEvent {
+            stream,
+            data,
+            timestamp: SystemTime::now(),
+        })?;
         Ok(())
     }
 
@@ -659,7 +674,7 @@ impl JobEngine {
         if !bytes.ends_with(b"\n") {
             bytes.push(b'\n');
         }
-        self.push_log(handle, stream, &bytes)
+        self.push_log(handle, stream, Bytes::from(bytes))
     }
 
     fn finish_job(
@@ -906,8 +921,8 @@ impl JobLogStream {
 
             let terminal = {
                 let job = self.handle.read().unwrap_or_else(|p| p.into_inner());
-                let new = job.log_buffer.since(self.cursor);
-                for ev in new {
+                let replay = job.log_buffer.replay_from(self.cursor);
+                for ev in &replay {
                     self.pending.push_back(event_to_frame(&self.job_id, ev));
                     self.cursor = ev.seq + 1;
                 }
