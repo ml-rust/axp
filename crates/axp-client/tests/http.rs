@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use axp_client::{AttachJobOptions, Client, Error};
 use axp_proto::{
-    Capability, DescribeRequest, EnforcementTier, IndexRequest, JobAttachRequest, JobPayload,
-    JobStartRequest, JobStartResponse, JobStatusProto, JobStatusRequest, SessionAuditRequest,
-    SessionCloseRequest, SessionOpenRequest, SessionOpenResponse,
+    Capability, DescribeRequest, EnforcementTier, IndexRequest, JobAttachRequest, JobId,
+    JobPayload, JobStartRequest, JobStartResponse, JobStatusProto, JobStatusRequest,
+    SessionAuditRequest, SessionCloseRequest, SessionId, SessionOpenRequest, SessionOpenResponse,
 };
 
 const MCP_PROVIDER: &str = "mcp_docs";
@@ -317,6 +317,24 @@ async fn attach_stream_uses_last_event_id_cursor() {
         frame.is_none(),
         "last event id should suppress replayed frames"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_job_returns_http_status_for_non_rpc_not_found_response() {
+    let base = spawn_server().await;
+    let client = Client::new(format!("{base}/missing")).expect("client");
+
+    let err = client
+        .attach_job(&JobAttachRequest {
+            session_id: SessionId("s_dummy".to_owned()),
+            cap_token: "ct_dummy".to_owned(),
+            job_id: JobId("j_dummy".to_owned()),
+            from_offset: 0,
+        })
+        .await
+        .expect_err("non-RPC 404 response");
+
+    assert!(matches!(err, Error::HttpStatus(404)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
