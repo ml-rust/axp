@@ -258,6 +258,15 @@ mod tests {
         );
     }
 
+    fn assert_bad_request_without_sse(resp: &Response, context: &str) {
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{context} must return HTTP 400"
+        );
+        assert_non_sse_response(resp);
+    }
+
     #[tokio::test]
     async fn attach_streams_terminal_job_as_sse() {
         let (state, sid, token, jid, _dir) = finished_job().await;
@@ -426,8 +435,28 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert_non_sse_response(&resp);
+        assert_bad_request_without_sse(&resp, "missing cap_token");
+    }
+
+    #[tokio::test]
+    async fn attach_malformed_from_offset_returns_bad_request_without_sse() {
+        let (state, sid, token, jid, _dir) = finished_job().await;
+        let router = build_router(state);
+        let uri = format!(
+            "/job/attach?session_id={}&cap_token={}&job_id={}&from_offset=not-a-number",
+            sid.0, token, jid.0
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_bad_request_without_sse(&resp, "malformed from_offset");
     }
 
     #[tokio::test]
@@ -457,12 +486,7 @@ mod tests {
                 .await
                 .expect("response");
 
-            assert_eq!(
-                resp.status(),
-                StatusCode::BAD_REQUEST,
-                "{case} must return HTTP 400"
-            );
-            assert_non_sse_response(&resp);
+            assert_bad_request_without_sse(&resp, case);
         }
     }
 
