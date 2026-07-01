@@ -125,6 +125,15 @@ async fn finished_command_job(command: &str) -> FinishedCommandJob {
     }
 }
 
+fn finished_command_attach_request(fixture: &FinishedCommandJob) -> JobAttachRequest {
+    JobAttachRequest {
+        session_id: fixture.session.session_id.clone(),
+        cap_token: fixture.session.cap_token.clone(),
+        job_id: fixture.started.job_id.clone(),
+        from_offset: 0,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn client_drives_session_job_and_attach_over_real_http() {
     let base = spawn_server().await;
@@ -278,17 +287,9 @@ async fn client_discovers_and_describes_mcp_mounted_tool_over_real_http() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_job_preserves_finite_replay_from_start_cursor() {
     let fixture = finished_command_job("printf 'finite-replay\\n'").await;
+    let attach = finished_command_attach_request(&fixture);
 
-    let frames = fixture
-        .client
-        .attach_job(&JobAttachRequest {
-            session_id: fixture.session.session_id,
-            cap_token: fixture.session.cap_token,
-            job_id: fixture.started.job_id,
-            from_offset: 0,
-        })
-        .await
-        .expect("attach");
+    let frames = fixture.client.attach_job(&attach).await.expect("attach");
 
     let output: Vec<u8> = frames.into_iter().flat_map(|frame| frame.data).collect();
     assert_eq!(String::from_utf8_lossy(&output), "finite-replay\n");
@@ -297,16 +298,12 @@ async fn attach_job_preserves_finite_replay_from_start_cursor() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attach_stream_uses_last_event_id_cursor() {
     let fixture = finished_command_job("printf 'cursor-replay\\n'").await;
+    let attach = finished_command_attach_request(&fixture);
 
     let mut stream = fixture
         .client
         .attach_job_stream_with_options(
-            &JobAttachRequest {
-                session_id: fixture.session.session_id,
-                cap_token: fixture.session.cap_token,
-                job_id: fixture.started.job_id,
-                from_offset: 0,
-            },
+            &attach,
             AttachJobOptions::new().with_last_event_id(1_000_000),
         )
         .await
@@ -320,16 +317,58 @@ async fn attach_stream_uses_last_event_id_cursor() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn attach_stream_next_frame_replays_multiple_frames() {
+    let fixture =
+        finished_command_job("printf 'stream-one\\n'; sleep 0.1; printf 'stream-two\\n'").await;
+    let attach = finished_command_attach_request(&fixture);
+
+    let mut stream = fixture
+        .client
+        .attach_job_stream_with_options(&attach, AttachJobOptions::new())
+        .await
+        .expect("attach stream");
+
+    let frames = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.next_frame().await.expect("next frame") {
+            frames.push(frame);
+        }
+        assert!(
+            stream.next_frame().await.expect("stream eof").is_none(),
+            "stream should stay at EOF after replay is drained"
+        );
+        frames
+    })
+    .await
+    .expect("attach stream should end");
+
+    assert!(
+        frames.len() >= 2,
+        "expected at least two replayed frames, got {frames:?}"
+    );
+    for (expected, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame.seq, expected as u64,
+            "replayed seqs must be contiguous"
+        );
+    }
+
+    let output: Vec<u8> = frames.into_iter().flat_map(|frame| frame.data).collect();
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("stream-one\n"), "got output: {output:?}");
+    assert!(output.contains("stream-two\n"), "got output: {output:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn attach_job_decodes_rpc_error_response() {
     let fixture = finished_command_job("printf 'attach-error\\n'").await;
+    let attach = finished_command_attach_request(&fixture);
 
     let err = fixture
         .client
         .attach_job(&JobAttachRequest {
-            session_id: fixture.session.session_id,
             cap_token: "ct_wrong".to_owned(),
-            job_id: fixture.started.job_id,
-            from_offset: 0,
+            ..attach
         })
         .await
         .expect_err("structured attach should return an RPC error");
