@@ -272,6 +272,21 @@ mod tests {
     }
 
     #[test]
+    fn mismatched_provider_id_returns_capability_parse() {
+        let descriptor = McpToolDescriptor {
+            provider_id: "other_docs".to_owned(),
+            ..tool("search", "Search the configured MCP documentation index")
+        };
+
+        let err = McpToolProvider::new("mcp_docs", vec![descriptor]).unwrap_err();
+
+        assert!(
+            matches!(err, Error::CapabilityParse { ref raw, .. } if raw == "other_docs"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn unknown_tool_returns_capability_not_found() {
         let provider = provider();
 
