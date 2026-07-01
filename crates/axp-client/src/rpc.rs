@@ -222,6 +222,58 @@ mod tests {
         assert!(matches!(err, Error::Rpc { code: -32601, .. }));
     }
 
+    fn rpc_response(
+        jsonrpc: &str,
+        id: serde_json::Value,
+        result: Option<serde_json::Value>,
+        error: Option<RpcError>,
+    ) -> RpcResponse<serde_json::Value> {
+        RpcResponse {
+            jsonrpc: jsonrpc.to_owned(),
+            id,
+            result,
+            error,
+        }
+    }
+
+    fn assert_invalid_rpc_response(response: RpcResponse<serde_json::Value>, expected: &str) {
+        let err = decode_rpc_response(response).expect_err("invalid response");
+        assert!(matches!(err, Error::InvalidRpcResponse(message) if message == expected));
+    }
+
+    #[test]
+    fn response_rejects_malformed_envelopes() {
+        for (response, expected) in [
+            (
+                rpc_response("1.0", json!(1), Some(json!({"ok": true})), None),
+                "unexpected jsonrpc version 1.0",
+            ),
+            (
+                rpc_response("2.0", json!(2), Some(json!({"ok": true})), None),
+                "unexpected response id 2",
+            ),
+            (
+                rpc_response(
+                    "2.0",
+                    json!(1),
+                    Some(json!({"ok": true})),
+                    Some(RpcError {
+                        code: -32603,
+                        message: "internal error".to_owned(),
+                        data: None,
+                    }),
+                ),
+                "response contained both result and error",
+            ),
+            (
+                rpc_response("2.0", json!(1), None, None),
+                "response contained neither result nor error",
+            ),
+        ] {
+            assert_invalid_rpc_response(response, expected);
+        }
+    }
+
     #[test]
     fn sse_data_lines_decode_frames() {
         let frame = LogEventFrame {
