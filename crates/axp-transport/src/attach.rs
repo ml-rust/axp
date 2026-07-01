@@ -172,6 +172,7 @@ mod tests {
     use axp_proto::{EnforcementTier, JobId, JobPayload, JobStartRequest, SessionId};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use axum::response::Response;
     use tower::ServiceExt;
 
     use crate::{router::build_router, state::AppState};
@@ -243,6 +244,18 @@ mod tests {
             }
         }
         out
+    }
+
+    fn assert_non_sse_response(resp: &Response) {
+        let ctype = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            !ctype.contains("text/event-stream"),
+            "expected a non-SSE response, got content-type: {ctype}"
+        );
     }
 
     #[tokio::test]
@@ -399,6 +412,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_missing_cap_token_returns_bad_request_without_sse() {
+        let (state, sid, _token, jid, _dir) = finished_job().await;
+        let router = build_router(state);
+        let uri = format!("/job/attach?session_id={}&job_id={}", sid.0, jid.0);
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_non_sse_response(&resp);
+    }
+
+    #[tokio::test]
     async fn attach_bad_token_does_not_stream_logs() {
         // A valid session+job but a WRONG cap_token must be rejected before the
         // log stream is built: the response must not be a 200 SSE stream.
@@ -428,14 +460,6 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "bad token must map to HTTP 401 Unauthorized"
         );
-        let ctype = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            !ctype.contains("text/event-stream"),
-            "bad token must not open an SSE stream, got content-type: {ctype}"
-        );
+        assert_non_sse_response(&resp);
     }
 }
