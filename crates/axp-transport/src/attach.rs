@@ -349,6 +349,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attach_malformed_last_event_id_falls_back_to_from_offset() {
+        let (state, sid, token, jid, _dir) = finished_job().await;
+        let router = build_router(state);
+        let uri = format!(
+            "/job/attach?session_id={}&cap_token={}&job_id={}&from_offset=0",
+            sid.0, token, jid.0
+        );
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("last-event-id", "not-a-number")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.expect("body");
+        let body = String::from_utf8_lossy(&bytes);
+        let payload = collected_log_bytes(&body);
+        assert!(
+            payload.windows(5).any(|w| w == b"hello"),
+            "malformed Last-Event-ID must fall back to from_offset and replay `hello`: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn attach_unknown_job_returns_not_found() {
         let (state, sid, token, _jid, _dir) = finished_job().await;
         let router = build_router(state);
