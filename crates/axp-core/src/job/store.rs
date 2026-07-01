@@ -7,15 +7,12 @@ use std::time::SystemTime;
 
 use axp_proto::{JobId, JobPayload, SessionId};
 
-use crate::{
-    Error, Result,
-    job::{JobStatus, LogBuffer},
-    workspace::Workspace,
-};
+use super::log::JobReplayLog;
+use crate::{Error, Result, job::JobStatus, workspace::Workspace};
 
 // ── Job ───────────────────────────────────────────────────────────────────────
 
-/// A live job bound to a session, with its runtime state and log buffer.
+/// A live job bound to a session, with its runtime state and injected replay log.
 ///
 /// `Job` is intentionally not `Clone` — it always lives behind
 /// `Arc<RwLock<Job>>` in the [`JobStore`] so all readers share the same
@@ -38,16 +35,23 @@ pub struct Job {
     pub started_at: Option<SystemTime>,
     /// Wall-clock time at which the process finished, if it has finished.
     pub finished_at: Option<SystemTime>,
-    /// Accumulated stdout/stderr log chunks.
-    pub log_buffer: LogBuffer,
+    /// Accumulated stdout/stderr log chunks owned by the job.
+    pub replay_log: Box<dyn JobReplayLog>,
 }
 
 impl Job {
     /// Create a new job in the [`JobStatus::Pending`] state.
     ///
     /// The caller is responsible for supplying a `cwd` that has already been
-    /// validated against the workspace (see [`resolve_cwd`]).
-    pub fn new(id: JobId, session_id: SessionId, payload: JobPayload, cwd: PathBuf) -> Self {
+    /// validated against the workspace (see [`resolve_cwd`]), plus the replay
+    /// log the job should own for its lifetime.
+    pub fn new(
+        id: JobId,
+        session_id: SessionId,
+        payload: JobPayload,
+        cwd: PathBuf,
+        replay_log: Box<dyn JobReplayLog>,
+    ) -> Self {
         Self {
             id,
             session_id,
@@ -57,7 +61,7 @@ impl Job {
             created_at: SystemTime::now(),
             started_at: None,
             finished_at: None,
-            log_buffer: LogBuffer::new(),
+            replay_log,
         }
     }
 }
@@ -195,6 +199,7 @@ pub fn resolve_cwd(rel: Option<&str>, workspace: &Workspace) -> Result<PathBuf> 
 
 #[cfg(test)]
 mod tests {
+    use super::super::log::InMemoryJobReplayLog;
     use super::*;
     use axp_proto::JobPayload;
 
@@ -212,6 +217,7 @@ mod tests {
                 command: "echo hi".into(),
             },
             ws.root().to_path_buf(),
+            Box::new(InMemoryJobReplayLog::new()),
         )
     }
 

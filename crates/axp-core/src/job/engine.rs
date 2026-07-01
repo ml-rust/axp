@@ -1,5 +1,5 @@
 //! Async job execution engine: spawns jobs as child processes and drains their
-//! stdout/stderr into each job's log buffer.
+//! stdout/stderr into each job's replay log.
 //!
 //! # Concurrency model
 //!
@@ -45,11 +45,11 @@ use axp_proto::{
 };
 use axp_sandbox::{SandboxError, SandboxPolicy};
 
-use super::log::{AppendLogEvent, DEFAULT_LOG_BYTE_CAP, JobReplayLog};
+use super::log::{AppendLogEvent, DEFAULT_LOG_BYTE_CAP, InMemoryJobReplayLog};
 use crate::{
     Error, Result,
     capability::{CapabilitySet, RuntimeCapability},
-    job::{Job, JobStatus, JobStore, LogBuffer, LogEvent, LogStream, Seq, resolve_cwd},
+    job::{Job, JobStatus, JobStore, LogEvent, LogStream, Seq, resolve_cwd},
     provider::ResolvedCommand,
     registry::ProviderRegistry,
     session::{AuditEventKind, SessionStore},
@@ -111,7 +111,7 @@ enum Runnable<'a> {
     Argv(ResolvedCommand),
 }
 
-/// Runs jobs as child processes, capturing their output into each job's log buffer.
+/// Runs jobs as child processes, capturing their output into each job's replay log.
 ///
 /// The engine does NOT own a tokio runtime — its async methods run on the ambient
 /// runtime (call them from within one). Cancellation senders live here (not on `Job`),
@@ -122,7 +122,7 @@ pub struct JobEngine {
     jobs: JobStore,
     next_id: Arc<AtomicU64>,
     cancels: Arc<Mutex<HashMap<JobId, CancelEntry>>>,
-    /// Per-job log-buffer byte cap. A job whose output exceeds this is killed and
+    /// Per-job replay-log byte cap. A job whose output exceeds this is killed and
     /// marked `Failed` (output is never silently dropped).
     log_byte_cap: usize,
     /// Capability provider registry, shared (typically with `AppState.registry`).
@@ -136,7 +136,7 @@ impl JobEngine {
     /// given capability provider `registry` (used to resolve capability payloads).
     ///
     /// Job ids begin at `j_1`; the cancellation table starts empty; the per-job
-    /// log-buffer cap defaults to [`DEFAULT_LOG_BYTE_CAP`]. Use
+    /// replay-log cap defaults to [`DEFAULT_LOG_BYTE_CAP`]. Use
     /// [`with_log_byte_cap`](Self::with_log_byte_cap) to override it.
     pub fn new(
         sessions: SessionStore,
@@ -153,7 +153,7 @@ impl JobEngine {
         }
     }
 
-    /// Override the per-job log-buffer byte cap (default [`DEFAULT_LOG_BYTE_CAP`]).
+    /// Override the per-job replay-log byte cap (default [`DEFAULT_LOG_BYTE_CAP`]).
     ///
     /// A job whose combined stdout+stderr exceeds this is killed and marked
     /// `Failed { reason: "log buffer overflow" }`.
@@ -386,8 +386,14 @@ impl JobEngine {
         cwd: std::path::PathBuf,
     ) -> (JobId, Arc<RwLock<Job>>) {
         let id = self.next_job_id();
-        let mut job = Job::new(id.clone(), req.session_id.clone(), req.payload.clone(), cwd);
-        job.log_buffer = LogBuffer::with_cap(self.log_byte_cap);
+        let replay_log = Box::new(InMemoryJobReplayLog::with_cap(self.log_byte_cap));
+        let mut job = Job::new(
+            id.clone(),
+            req.session_id.clone(),
+            req.payload.clone(),
+            cwd,
+            replay_log,
+        );
         job.status = JobStatus::Running;
         job.started_at = Some(SystemTime::now());
         let handle = self.jobs.insert(job);
@@ -533,7 +539,7 @@ impl JobEngine {
     /// This runs on a detached tokio task.  It concurrently reads both pipes and
     /// listens for a cancellation signal via `tokio::select!`; on cancellation it
     /// best-effort kills the child but keeps draining until both pipes hit EOF so
-    /// no buffered output is lost.  If the log buffer overflows, the job is killed
+    /// no buffered output is lost.  If the replay log overflows, the job is killed
     /// and marked `Failed`.
     async fn run_to_completion(
         &self,
@@ -646,17 +652,17 @@ impl JobEngine {
         self.finish_job(job_id, session_id, handle, final_status);
     }
 
-    /// Push a chunk of output into a job's log buffer.
+    /// Push a chunk of output into a job's replay log.
     ///
     /// The write lock is acquired and dropped entirely within this synchronous
     /// function — there is no `.await` inside — so the locking discipline holds.
     ///
     /// # Errors
     ///
-    /// Propagates [`Error::LogBufferOverflow`] from the underlying buffer.
+    /// Propagates [`Error::LogBufferOverflow`] from the underlying replay log.
     fn push_log(&self, handle: &Arc<RwLock<Job>>, stream: LogStream, data: Bytes) -> Result<()> {
         let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
-        job.log_buffer.append(AppendLogEvent {
+        job.replay_log.append(AppendLogEvent {
             stream,
             data,
             timestamp: SystemTime::now(),
@@ -694,7 +700,7 @@ impl JobEngine {
             let mut job = handle.write().unwrap_or_else(|p| p.into_inner());
             job.status = final_status.clone();
             job.finished_at = Some(SystemTime::now());
-            job.log_buffer.subscribe()
+            job.replay_log.subscribe()
         };
         notify.notify_waiters();
 
@@ -808,7 +814,7 @@ impl JobEngine {
         Ok(axp_proto::JobStatusResponse {
             job_id: req.job_id.clone(),
             status: j.status.clone().into(),
-            seq: j.log_buffer.len() as u64,
+            seq: j.replay_log.next_seq(),
         })
     }
 
@@ -826,7 +832,7 @@ impl JobEngine {
         let handle = self.lookup_owned(&req.session_id, &req.job_id)?;
         let notify = {
             let j = handle.read().unwrap_or_else(|p| p.into_inner());
-            j.log_buffer.subscribe()
+            j.replay_log.subscribe()
         };
         Ok(JobLogStream {
             job_id: req.job_id.clone(),
@@ -921,7 +927,7 @@ impl JobLogStream {
 
             let terminal = {
                 let job = self.handle.read().unwrap_or_else(|p| p.into_inner());
-                let replay = job.log_buffer.replay_from(self.cursor);
+                let replay = job.replay_log.replay_from(self.cursor);
                 for ev in &replay {
                     self.pending.push_back(event_to_frame(&self.job_id, ev));
                     self.cursor = ev.seq + 1;
@@ -1323,7 +1329,8 @@ mod tests {
         let handle = engine.jobs().get(id).expect("job present");
         let job = handle.read().unwrap();
         let mut out = Vec::new();
-        for ev in job.log_buffer.since(0) {
+        let replay = job.replay_log.replay_from(0);
+        for ev in &replay {
             if ev.stream == stream {
                 out.extend_from_slice(&ev.data);
             }
