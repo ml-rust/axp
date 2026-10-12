@@ -20,37 +20,36 @@ this is a good time to help shape it.
 1. **Open an issue first** to sketch the idea and gauge interest, so effort isn't wasted on something
    out of scope.
 2. **Submit an RFC** by copying [`rfcs/0000-template.md`](rfcs/0000-template.md) and opening a PR.
-   A good RFC covers: the problem, the proposed design, alternatives considered, security
+   A good RFC covers: the motivation, the proposed design, alternatives considered, security
    implications, and backward-compatibility. See [`rfcs/README.md`](rfcs/README.md) for details.
 3. **Discussion happens on the PR.** Decisions favor clear technical reasoning and the project's
    design principles (see `docs/AXP-ARCHITECTURE.md`).
-4. **Acceptance** is recorded in the RFC; implementation can then proceed.
+4. **Acceptance** is recorded in the RFC. Implementation can then proceed.
 
 Small, non-protocol changes (typos, doc fixes, bug fixes in tooling) can skip the RFC and go straight
 to a PR.
 
-## Design principles to keep in mind
+## Design principles
 
 AXP aims to be **safe by default, lean on context, and interoperable**. Proposals are weighed against:
 
 - **Security first** — does it preserve least-privilege, the sandbox boundary, and control/data-plane
   separation? Changes that weaken the default security posture need strong justification.
-- **Honest guarantees** — capabilities and sandbox tiers should state what they actually provide across
-  platforms, not imply more.
+- **Honest guarantees** — capabilities and sandbox tiers must state what they provide across
+  platforms. They must not imply more.
 - **Interoperability** — does it stay compatible with MCP interop where relevant?
-- **Simplicity** — prefer the smallest design that solves the real problem.
+- **Simplicity** — prefer the smallest design that solves the real need.
 
 ## Development setup
 
-The core runtime is written in **Rust** and targets Linux, macOS, and Windows on x86_64 and arm64.
+The runtime is written in **Rust**. Use Rust 1.85 or later. Run these commands from the repo root. The root `Cargo.toml` defines the whole workspace.
 
 ```bash
-# (placeholder — build instructions will land with the initial runtime)
 cargo build
 cargo test
 ```
 
-Until the runtime lands, the most useful contributions are design discussion and RFCs.
+The `kernel-lsm` sandbox works on Linux only. See [README](README.md#sandbox-tiers).
 
 ## Code of conduct
 
@@ -60,8 +59,8 @@ Assume good faith, critique ideas rather than people, and keep discussion techni
 ## Licensing
 
 By contributing, you agree that your contributions are licensed under the project's **Apache License
-2.0**. A Developer Certificate of Origin (DCO) sign-off may be required on commits (`git commit -s`);
-this will be confirmed as the project's governance is set up.
+2.0**. The project has not confirmed a Developer Certificate of Origin (DCO) sign-off requirement.
+Use `git commit -s` to add a sign-off.
 
 ## Questions
 
