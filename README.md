@@ -41,6 +41,18 @@ AXP (Agent Execution Protocol) gives each agent a session. The session binds a w
 
 AXP is an early draft. The protocol and the runtime will change.
 
+- **What is here:** a JSON-RPC over HTTP protocol, a runtime server (`axp serve`), and a Rust client (`axp-client`). Agents run shell commands, WebAssembly components, and named capabilities as jobs.
+- **Language:** the runtime and client are Rust. Python is not needed. The sandbox calls the Linux kernel through Landlock and seccomp. Code mode runs WebAssembly through `wasmtime`.
+- **Built on:** `tokio`, `axum`, `landlock`, `seccompiler`, and `wasmtime`.
+
+### Not supported yet
+
+- Sandbox tiers `container` and `process-token`. Job start fails.
+- Sandboxing on macOS and Windows. Only `dev-none`, which enforces nothing, runs there.
+- Network filtering for `net.connect` and a PTY for `pty.open`.
+- SDKs for TypeScript, Python, and Go.
+- Persistent sessions. A server restart ends all sessions and jobs.
+
 ## Protocol
 
 An agent opens a session with `session.open`. The session holds a workspace, a sandbox tier, and capability grants.
@@ -69,7 +81,7 @@ The protocol design is in [docs/AXP-ARCHITECTURE.md](docs/AXP-ARCHITECTURE.md). 
 Prerequisites: Rust 1.85 or later. AXP is not on crates.io, so build it from this repo.
 
 ```bash
-cargo build --release -p axp
+cargo build --release -p axp-cli
 ./target/release/axp serve
 ```
 
